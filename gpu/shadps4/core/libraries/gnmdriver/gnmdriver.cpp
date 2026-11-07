@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdio>
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -368,8 +370,25 @@ void PS4_SYSV_ABI sceGnmDingDongForWorkload(u32 gnm_vqid, u32 next_offs_dw, u64 
     sceGnmDingDong(gnm_vqid, next_offs_dw);
 }
 
-int PS4_SYSV_ABI sceGnmDisableMipStatsReport() {
-    LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
+// gow3 (Killzone): the GPU's texture mip-usage reports. Guerrilla's GDC 2014 talk says Killzone's
+// texture streamer uses them (it also ships baked per-section "mipstats" lumps). They are still
+// stubs: these log the raw arguments (the first four registers; the exact signatures are not
+// public) and how often each is called, the first step to emulating the report.
+static void LogMipStatsCall(const char* name, std::atomic<u64>& calls, u64 a0, u64 a1, u64 a2,
+                            u64 a3) {
+    const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 4 || (n & (n - 1)) == 0) { // the first four, then at powers of two
+        std::printf("Mip stats: %s call %llu (stub), args %#llx %#llx %#llx %#llx\n", name,
+                    static_cast<unsigned long long>(n), static_cast<unsigned long long>(a0),
+                    static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                    static_cast<unsigned long long>(a3));
+        std::fflush(stdout);
+    }
+}
+
+int PS4_SYSV_ABI sceGnmDisableMipStatsReport(u64 a0, u64 a1, u64 a2, u64 a3) {
+    static std::atomic<u64> calls{0};
+    LogMipStatsCall("sceGnmDisableMipStatsReport", calls, a0, a1, a2, a3);
     return ORBIS_OK;
 }
 
@@ -1309,8 +1328,9 @@ int PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceGnmRequestMipStatsReportAndReset() {
-    LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
+int PS4_SYSV_ABI sceGnmRequestMipStatsReportAndReset(u64 a0, u64 a1, u64 a2, u64 a3) {
+    static std::atomic<u64> calls{0};
+    LogMipStatsCall("sceGnmRequestMipStatsReportAndReset", calls, a0, a1, a2, a3);
     return ORBIS_OK;
 }
 
@@ -1786,8 +1806,9 @@ int PS4_SYSV_ABI sceGnmSetSpiEnableSqCountersForUnitInstance() {
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
-int PS4_SYSV_ABI sceGnmSetupMipStatsReport() {
-    LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
+int PS4_SYSV_ABI sceGnmSetupMipStatsReport(u64 a0, u64 a1, u64 a2, u64 a3) {
+    static std::atomic<u64> calls{0};
+    LogMipStatsCall("sceGnmSetupMipStatsReport", calls, a0, a1, a2, a3);
     return ORBIS_OK;
 }
 

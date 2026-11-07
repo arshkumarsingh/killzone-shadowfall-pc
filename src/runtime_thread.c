@@ -15,6 +15,7 @@
 #include <setjmp.h>
 #include <errno.h>
 #include <unistd.h>
+#include "gpu/shim/gow3_pcores.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -289,11 +290,26 @@ void runtime_set_guest_fpu(void) {
     __asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));
     __asm__ volatile("fldcw %0" : : "m"(fpucw));
 }
+/* Hybrid CPUs: every game thread (job workers, main, streaming, sound) prefers the performance
+ * cores (gpu/shim/gow3_pcores.h). Reported once. */
+void runtime_guest_thread_cpus(void) {
+    unsigned total=0;
+    const unsigned performance=gow3_prefer_performance_cores(&total);
+#ifdef _WIN32
+    static volatile LONG reported;
+    if (performance && !InterlockedExchange(&reported,1))
+        printf("Runtime: hybrid CPU, game threads prefer the %u performance logical processors of %u "
+               "(GOW3_PCORE_THREADS=0: off)\n",performance,total);
+#else
+    (void)performance;
+#endif
+}
 static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     set_host_name(t->name);
     set_host_priority(t->name,t->attr.prio);
+    runtime_guest_thread_cpus();
     runtime_set_guest_fpu();
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();

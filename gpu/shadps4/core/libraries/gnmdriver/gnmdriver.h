@@ -35,7 +35,7 @@ s32 PS4_SYSV_ABI sceGnmDeleteEqEvent(OrbisKernelEqueue eq, u64 id);
 int PS4_SYSV_ABI sceGnmDestroyWorkloadStream();
 void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw);
 void PS4_SYSV_ABI sceGnmDingDongForWorkload(u32 gnm_vqid, u32 next_offs_dw, u64 workload_id);
-int PS4_SYSV_ABI sceGnmDisableMipStatsReport();
+int PS4_SYSV_ABI sceGnmDisableMipStatsReport(u64 a0, u64 a1, u64 a2, u64 a3);
 s32 PS4_SYSV_ABI sceGnmDispatchDirect(u32* cmdbuf, u32 size, u32 threads_x, u32 threads_y,
                                       u32 threads_z, u32 flags);
 s32 PS4_SYSV_ABI sceGnmDispatchIndirect(u32* cmdbuf, u32 size, u32 data_offset, u32 flags);
@@ -140,7 +140,7 @@ s32 PS4_SYSV_ABI sceGnmRegisterResource(void* res_handle, void* owner_handle, co
                                         size_t size, const char* name, int res_type, u64 user_data);
 int PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDone();
 int PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload();
-int PS4_SYSV_ABI sceGnmRequestMipStatsReportAndReset();
+int PS4_SYSV_ABI sceGnmRequestMipStatsReportAndReset(u64 a0, u64 a1, u64 a2, u64 a3);
 s32 PS4_SYSV_ABI sceGnmResetVgtControl(u32* cmdbuf, u32 size);
 int PS4_SYSV_ABI sceGnmSdmaClose();
 int PS4_SYSV_ABI sceGnmSdmaConstFill();
@@ -167,7 +167,7 @@ int PS4_SYSV_ABI sceGnmSetResourceRegistrationUserMemory();
 int PS4_SYSV_ABI sceGnmSetResourceUserData();
 int PS4_SYSV_ABI sceGnmSetSpiEnableSqCounters();
 int PS4_SYSV_ABI sceGnmSetSpiEnableSqCountersForUnitInstance();
-int PS4_SYSV_ABI sceGnmSetupMipStatsReport();
+int PS4_SYSV_ABI sceGnmSetupMipStatsReport(u64 a0, u64 a1, u64 a2, u64 a3);
 s32 PS4_SYSV_ABI sceGnmSetVgtControl(u32* cmdbuf, u32 size, u32 prim_group_sz_minus_one,
                                      u32 partial_vs_wave_mode, u32 wd_switch_only_on_eop_mode);
 s32 PS4_SYSV_ABI sceGnmSetVsShader(u32* cmdbuf, u32 size, const u32* vs_regs, u32 shader_modifier);

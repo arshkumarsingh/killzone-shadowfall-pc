@@ -8,6 +8,7 @@
 #endif
 #include <time.h>
 #include "gow3_copy.h"
+#include "gow3_pcores.h"
 #include "gow3_toggles.h"
 #include <cstdio>
 #include <boost/preprocessor/stringize.hpp>
@@ -120,6 +121,12 @@ void Liverpool::Process(std::stop_token stoken) {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         std::printf("GPU: command thread above normal priority (%u hardware threads)\n",
                     std::thread::hardware_concurrency());
+    }
+    // gow3 (Killzone): on hybrid CPUs it prefers the performance cores, as the game's threads do
+    // (gow3_pcores.h). GOW3_PCORE_THREADS=0: off.
+    if (const unsigned performance = gow3_prefer_performance_cores(nullptr)) {
+        std::printf("GPU: command thread prefers the %u performance logical processors\n",
+                    performance);
     }
 #endif
     gpu_id = std::this_thread::get_id();
