@@ -71,6 +71,16 @@ public:
         return pipeline_binary_global_key;
     }
 
+    /// gow3: VK_EXT_graphics_pipeline_library enabled for fast-linked pipelines (GOW3_GPL,
+    /// vk_pipeline_library.h): the feature, fast linking and independent interpolation.
+    bool IsGraphicsPipelineLibraryEnabled() const {
+        return graphics_pipeline_library;
+    }
+    /// gow3: why it is off ("off (...)"), for the startup line.
+    const char* GraphicsPipelineLibraryStatus() const {
+        return graphics_pipeline_library_status;
+    }
+
     /// Returns the VMA allocator handle
     VmaAllocator GetAllocator() const {
         return allocator;
@@ -590,6 +600,8 @@ private:
     bool maintenance_5{};
     bool pipeline_binaries{};
     vk::PipelineBinaryKeyKHR pipeline_binary_global_key{};
+    bool graphics_pipeline_library{}; // gow3: GOW3_GPL
+    const char* graphics_pipeline_library_status = "off";
     bool maintenance_8{};
     bool maximal_reconvergence{};
     bool attachment_feedback_loop{};

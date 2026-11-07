@@ -15,6 +15,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_lighting_test.h"
+#include "video_core/renderer_vulkan/vk_pipeline_library.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "common/elf_info.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -49,9 +50,10 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
+    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
+    PipelineLinker* linker)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
-      fetch_shader{std::move(fetch_shader_)} {
+      fetch_shader{std::move(fetch_shader_)}, fast_linked{linker != nullptr} {
     const auto started = Clock::now();
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
@@ -433,9 +435,15 @@ GraphicsPipeline::GraphicsPipeline(
 
     const auto binary_directory = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
         Common::ElfInfo::Instance().GameSerial() / "pipeline-binaries";
+    // gow3: GOW3_GPL: `linker` links this create info from stage libraries instead.
     auto [pipeline_result, pipe] =
-        CreateCachedGraphicsPipeline(device, pipeline_cache, pipeline_info, key,
-                                     instance.GetPipelineBinaryGlobalKey(), binary_directory);
+        linker ? linker->Create(*this, pipeline_info, false)
+               : CreateCachedGraphicsPipeline(device, pipeline_cache, pipeline_info, key,
+                                              instance.GetPipelineBinaryGlobalKey(),
+                                              binary_directory);
+    if (linker && !pipe) {
+        return; // not linked (PipelineLinker::outcome): the caller drops this object
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
@@ -449,8 +457,14 @@ GraphicsPipeline::GraphicsPipeline(
         auto square_info = pipeline_info;
         square_info.pColorBlendState = &square_blending;
         auto [square_result, square] =
-            CreateCachedGraphicsPipeline(device, pipeline_cache, square_info, key,
-                                         instance.GetPipelineBinaryGlobalKey(), binary_directory);
+            linker ? linker->Create(*this, square_info, true)
+                   : CreateCachedGraphicsPipeline(device, pipeline_cache, square_info, key,
+                                                  instance.GetPipelineBinaryGlobalKey(),
+                                                  binary_directory);
+        if (linker && !square) {
+            pipeline.reset();
+            return;
+        }
         ASSERT_MSG(square_result == vk::Result::eSuccess,
                    "Failed to create the squaring pipeline: {}", vk::to_string(square_result));
         square_pipeline = std::move(square);
@@ -568,6 +582,9 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     ASSERT_MSG(layout_result == vk::Result::eSuccess,
                "Failed to create graphics descriptor set layout: {}", vk::to_string(layout_result));
     desc_layout = std::move(layout);
+    if (fast_linked) {
+        desc_bindings.assign(bindings.begin(), bindings.end()); // gow3: part keys (GOW3_GPL)
+    }
 }
 
 } // namespace Vulkan

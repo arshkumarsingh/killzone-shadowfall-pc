@@ -271,6 +271,38 @@ void ReportPipelineBinaryCache() {
                 binary_load_ns.load() / 1e6 / std::max(u64{1}, hits + misses));
 }
 
+bool PipelineBinaryOnDisk(vk::Device device, const vk::GraphicsPipelineCreateInfo& info,
+                          const vk::PipelineBinaryKeyKHR& global_key,
+                          const std::filesystem::path& directory) {
+    using namespace PipelineBinaryCache;
+    if (!global_key.keySize || !EmulatorSettings.IsPipelineCacheEnabled()) {
+        return false;
+    }
+    // The key as CreateCachedGraphicsPipeline computes it (capture flag included).
+    vk::PipelineCreateFlags2CreateInfoKHR flags{
+        .pNext = info.pNext,
+        .flags = vk::PipelineCreateFlags2{static_cast<VkPipelineCreateFlags>(info.flags)} |
+                 vk::PipelineCreateFlagBits2::eCaptureDataKHR,
+    };
+    auto captured_info = info;
+    captured_info.pNext = &flags;
+    vk::PipelineCreateInfoKHR key_info{.pNext = &captured_info};
+    vk::PipelineBinaryKeyKHR pipeline_key;
+    if (device.getPipelineKeyKHR(&key_info, &pipeline_key) != vk::Result::eSuccess) {
+        return false;
+    }
+    const auto pipeline_id = BinaryKey(pipeline_key);
+    if (!ValidKey(BinaryKey(global_key)) || !ValidKey(pipeline_id)) {
+        return false;
+    }
+    std::string name;
+    for (const auto byte : pipeline_id) {
+        name += fmt::format("{:02x}", byte);
+    }
+    std::error_code error;
+    return std::filesystem::is_regular_file(directory / (name + ".bin"), error);
+}
+
 vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
     vk::Device device, vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info,
     const GraphicsPipelineKey& key, const vk::PipelineBinaryKeyKHR& global_key,

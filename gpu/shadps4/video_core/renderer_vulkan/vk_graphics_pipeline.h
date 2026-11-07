@@ -4,6 +4,8 @@
 #pragma once
 
 #include <algorithm>
+#include <span>
+#include <vector>
 
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
@@ -27,6 +29,7 @@ static constexpr u32 MaxVertexBufferCount = 32;
 class Instance;
 class Scheduler;
 class DescriptorHeap;
+class PipelineLinker;
 
 template <typename T>
 using VertexInputs = boost::container::static_vector<T, MaxVertexBufferCount>;
@@ -93,8 +96,21 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, PipelineLinker* linker = nullptr);
     ~GraphicsPipeline();
+
+    /// gow3: GOW3_GPL: linked from stage libraries by `linker` (vk_pipeline_library.h) instead
+    /// of compiled; the optimized pipeline replaces it. Without a handle when it was not linked.
+    [[nodiscard]] bool IsFastLinked() const noexcept {
+        return fast_linked;
+    }
+    /// gow3: the descriptor set layout's bindings (kept for fast-linked pipelines only).
+    [[nodiscard]] std::span<const vk::DescriptorSetLayoutBinding> DescriptorBindings() const noexcept {
+        return desc_bindings;
+    }
+    [[nodiscard]] bool PushDescriptors() const noexcept {
+        return uses_push_descriptors;
+    }
 
     // gow3: switch from compiler-owned snapshots to live stage data on publication.
     void PublishStages(std::span<const Shader::Info*, MaxShaderStages> infos) {
@@ -128,6 +144,8 @@ private:
     GraphicsPipelineKey key;
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
     vk::UniquePipeline square_pipeline;
+    bool fast_linked = false;
+    std::vector<vk::DescriptorSetLayoutBinding> desc_bindings;
 };
 
 struct ClipDistanceShaderKey {

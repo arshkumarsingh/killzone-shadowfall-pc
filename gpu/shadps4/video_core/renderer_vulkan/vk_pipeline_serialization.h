@@ -36,6 +36,11 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
     const GraphicsPipelineKey& key, const vk::PipelineBinaryKeyKHR& global_key,
     const std::filesystem::path& directory);
 void ReportPipelineBinaryCache();
+/// gow3: GOW3_GPL: whether CreateCachedGraphicsPipeline would find a binary for `info` on disk
+/// (computes the driver's pipeline key; restoring beats linking from libraries).
+bool PipelineBinaryOnDisk(vk::Device device, const vk::GraphicsPipelineCreateInfo& info,
+                          const vk::PipelineBinaryKeyKHR& global_key,
+                          const std::filesystem::path& directory);
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata);

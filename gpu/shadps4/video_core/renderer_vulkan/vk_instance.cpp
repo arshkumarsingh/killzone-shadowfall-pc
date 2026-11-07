@@ -512,6 +512,48 @@ bool Instance::CreateDevice() {
         // AMD reports no width for graphics executables; its own extension has the ISA.
         amd_shader_info = add_extension(VK_AMD_SHADER_INFO_EXTENSION_NAME);
     }
+    // gow3: GOW3_GPL (default on): a pipeline not built yet is linked at once from stage
+    // libraries while the optimized one compiles (vk_pipeline_library.h). Needs fast linking,
+    // and interpolation decorations allowed to differ between the stages (the recompiler does not
+    // mirror a fragment input's Flat on the vertex output). GOW3_GPL=0 leaves it out entirely.
+    {
+        const char* env = std::getenv("GOW3_GPL");
+        const auto listed = [&](const char* name) {
+            return std::find(available_extensions.begin(), available_extensions.end(),
+                             std::string{name}) != available_extensions.end();
+        };
+        if (env && env[0] == '0') {
+            graphics_pipeline_library_status = "off (GOW3_GPL=0)";
+        } else if (!listed(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) ||
+                   !listed(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+            graphics_pipeline_library_status =
+                "off (the driver has no VK_EXT_graphics_pipeline_library)";
+        } else {
+            const auto gpl_features =
+                physical_device
+                    .getFeatures2<vk::PhysicalDeviceFeatures2,
+                                  vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
+                    .get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
+            const auto gpl_properties =
+                physical_device
+                    .getProperties2<vk::PhysicalDeviceProperties2,
+                                    vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>()
+                    .get<vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>();
+            if (!gpl_features.graphicsPipelineLibrary) {
+                graphics_pipeline_library_status = "off (graphicsPipelineLibrary unsupported)";
+            } else if (!gpl_properties.graphicsPipelineLibraryFastLinking) {
+                graphics_pipeline_library_status = "off (no fast linking on this driver)";
+            } else if (!gpl_properties.graphicsPipelineLibraryIndependentInterpolationDecoration) {
+                graphics_pipeline_library_status =
+                    "off (the driver needs matching interpolation decorations)";
+            } else {
+                graphics_pipeline_library =
+                    add_extension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+                    add_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+                graphics_pipeline_library_status = graphics_pipeline_library ? "on" : "off";
+            }
+        }
+    }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 
@@ -810,6 +852,15 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
     }
 
+    // gow3: GOW3_GPL: its feature goes in front of the chain (kept out of the list above).
+    vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl_feature{
+        .graphicsPipelineLibrary = true,
+    };
+    if (graphics_pipeline_library) {
+        auto& device_info = device_chain.get<vk::DeviceCreateInfo>();
+        gpl_feature.pNext = const_cast<void*>(device_info.pNext);
+        device_info.pNext = &gpl_feature;
+    }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));

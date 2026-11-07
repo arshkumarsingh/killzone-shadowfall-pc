@@ -43,6 +43,7 @@ class Scheduler;
 class ShaderCache;
 struct AsyncShaderCompilation;
 struct AsyncGraphicsCompilation;
+struct FastLinkState;
 
 struct Program {
     struct Module {
@@ -220,6 +221,13 @@ private:
                      std::optional<Shader::StageSpecialization> specialization = {});
     void PublishShaders(bool wait = false);
     void PublishGraphics(bool wait = false);
+    /// gow3: GOW3_GPL fast link (vk_pipeline_library.h), GPU thread: the pipeline for `sel`
+    /// linked now from ready libraries, else null (a fast-link job may be queued; `urgent` when
+    /// the optimized compile should jump the queue: its binary is on disk).
+    const GraphicsPipeline* TryFastLink(bool& urgent);
+    void QueueFastLink();
+    void PublishFastLinks(bool wait = false);
+    bool WaitForFastLink();
     void FinishCompilations();
     void SeedWorkerCaches();
     /// gow3: the driver's VkPipelineCache blob kept between sessions (vk_pipeline_cache.cpp).
@@ -264,6 +272,9 @@ private:
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;
+    /// gow3: GOW3_GPL state; declared before the pipeline maps so that its libraries are
+    /// destroyed after the pipelines linked from them.
+    std::unique_ptr<FastLinkState> fast_link;
     Shader::Profile profile{};
     Shader::Pools pools;
     CompilerPool<Shader::Pools> compiler_pools{8};
