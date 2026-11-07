@@ -4,15 +4,17 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <span>
 
 #include "core/memory.h"
+#include "video_core/renderer_vulkan/vk_stream_out.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
-#include "video_core/renderer_vulkan/vk_stream_out.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
