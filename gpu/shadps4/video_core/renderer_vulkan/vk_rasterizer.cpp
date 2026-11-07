@@ -43,7 +43,7 @@ namespace {
 /// gow3 (Killzone): geometry-shader draws dropped for on-chip GS or stream-out (GsReject in
 /// vk_pipeline_cache.h). Each new ES/GS program pair is printed once, then every 5 s with drops
 /// a count, so a play session shows how often and which programs. GPU command thread only.
-void NoteSkippedGsDraw(const GsReject& reject) {
+void NoteSkippedGsDraw(const GsReject& reject, const AmdGpu::Regs& regs) {
     struct Program {
         u64 es, gs;
         u32 onchip, strmout;
@@ -68,6 +68,17 @@ void NoteSkippedGsDraw(const GsReject& reject) {
                     programs.size(), static_cast<unsigned long long>(reject.es_address),
                     static_cast<unsigned long long>(reject.gs_address), reject.onchip,
                     reject.strmout_config);
+        // Where it draws, to tell which effect it is (a small layered target would be a
+        // volume, the full-size scene target a screen effect, none a stream-out-only pass).
+        const auto& cb = regs.color_buffers[0];
+        const auto& db = regs.depth_buffer;
+        std::printf("Geometry shaders:   color target 0 %#llx %ux%u, %u slices, data format %u; "
+                    "depth %#llx %ux%u\n",
+                    static_cast<unsigned long long>(cb ? cb.Address() : 0), cb ? cb.Pitch() : 0u,
+                    cb ? cb.Height() : 0u, cb ? cb.NumSlices() : 0u,
+                    cb ? static_cast<unsigned>(cb.GetDataFmt()) : 0u,
+                    static_cast<unsigned long long>(db.DepthValid() ? db.DepthAddress() : 0),
+                    db.DepthValid() ? db.Pitch() : 0u, db.DepthValid() ? db.Height() : 0u);
         std::fflush(stdout);
     }
     const auto now = std::chrono::steady_clock::now();
@@ -1181,7 +1192,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
     }
     if (!pipeline) {
         if (const auto reject = LastGsReject(); reject.rejected) {
-            NoteSkippedGsDraw(reject);
+            NoteSkippedGsDraw(reject, Regs());
         }
         static const u64 trace_addr = [] {
             const char* env = std::getenv("GOW3_TRACE_ADDR");
