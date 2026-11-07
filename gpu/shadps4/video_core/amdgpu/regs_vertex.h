@@ -237,6 +237,16 @@ struct StreamOutBufferConfig {
     u32 stream_3_buf_en : 4;
 };
 
+/// gow3 (stream-out): VGT_STRMOUT_BUFFER_SIZE_n .. VGT_STRMOUT_BUFFER_OFFSET_n. The base address
+/// is the shader's V# (the BASE register is unused since GFX6); sizes and offsets count dwords
+/// from it.
+struct StreamOutBuffer {
+    u32 size;       ///< end of the buffer
+    u32 vtx_stride; ///< dwords per vertex
+    u32 base;       ///< unused
+    u32 offset;     ///< where the next vertex goes (IT_STRMOUT_BUFFER_UPDATE sets it)
+};
+
 struct LsHsConfig {
     u32 num_patches : 8;
     u32 hs_input_control_points : 6;

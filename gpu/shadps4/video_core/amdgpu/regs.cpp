@@ -110,6 +110,8 @@ static_assert(GFX6_3D_REG_INDEX(vgt_instance_step_rate_0) == 0xA2A8);
 static_assert(GFX6_3D_REG_INDEX(vgt_instance_step_rate_1) == 0xA2A9);
 static_assert(GFX6_3D_REG_INDEX(vgt_esgs_ring_itemsize) == 0xA2AB);
 static_assert(GFX6_3D_REG_INDEX(vgt_gsvs_ring_itemsize) == 0xA2AC);
+static_assert(GFX6_3D_REG_INDEX(vgt_strmout_buffers[0].size) == 0xA2B4);
+static_assert(GFX6_3D_REG_INDEX(vgt_strmout_buffers[3].offset) == 0xA2C3);
 static_assert(GFX6_3D_REG_INDEX(stage_enable) == 0xA2D5);
 static_assert(GFX6_3D_REG_INDEX(vgt_gs_vert_itemsize[0]) == 0xA2D7);
 static_assert(GFX6_3D_REG_INDEX(tess_config) == 0xA2DB);

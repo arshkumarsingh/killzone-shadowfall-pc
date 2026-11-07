@@ -167,13 +167,19 @@ struct HwGeometryRuntimeInfo {
     AmdGpu::GsScenario mode;
     std::span<const u32> vs_copy;
     u64 vs_copy_hash;
+    /// gow3 (stream-out, GOW3_STREAMOUT): the buffers stream 0 writes (VGT_STRMOUT_BUFFER_CONFIG)
+    /// and their vertex strides in dwords (VGT_STRMOUT_VTX_STRIDE_n); 0: no stream-out. Zero in
+    /// cached entries from before (RuntimeInfo::Initialize clears the whole union).
+    u32 xfb_buffer_mask{};
+    std::array<u32, 4> xfb_strides{};
 
     bool operator==(const HwGeometryRuntimeInfo& other) const {
         return num_outputs == other.num_outputs && outputs == other.outputs && num_invocations &&
                other.num_invocations && output_vertices == other.output_vertices &&
                in_primitive == other.in_primitive &&
                std::ranges::equal(out_primitive, other.out_primitive) &&
-               vs_copy_hash == other.vs_copy_hash;
+               vs_copy_hash == other.vs_copy_hash && xfb_buffer_mask == other.xfb_buffer_mask &&
+               xfb_strides == other.xfb_strides;
     }
 };
 
@@ -243,6 +249,10 @@ struct HwFragmentRuntimeInfo {
                                   other.inputs.begin() + num_inputs);
     }
 };
+
+// gow3: the pipeline cache stores RuntimeInfo as raw bytes; the stream-out fields must not grow
+// the HwInfo union (the fragment member is its largest).
+static_assert(sizeof(HwGeometryRuntimeInfo) <= sizeof(HwFragmentRuntimeInfo));
 
 struct HwComputeRuntimeInfo {
     u32 shared_memory_size;

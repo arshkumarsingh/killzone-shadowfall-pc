@@ -77,7 +77,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
         .size = arena_page_size,
-        .usage = ARENA_USAGE,
+        // gow3 (stream-out): as the arenas are made (Buffer: transform feedback targets).
+        .usage = ARENA_USAGE | (instance.IsTransformFeedbackSupported()
+                                    ? vk::BufferUsageFlags{vk::BufferUsageFlagBits::
+                                                               eTransformFeedbackBufferEXT}
+                                    : vk::BufferUsageFlags{}),
         .sharingMode = vk::SharingMode::eExclusive,
     };
     const vk::DeviceBufferMemoryRequirements req_info = {

@@ -138,7 +138,9 @@ union Regs {
         INSERT_PADDING_WORDS(1);
         u32 vgt_esgs_ring_itemsize;
         u32 vgt_gsvs_ring_itemsize;
-        INSERT_PADDING_WORDS(33);
+        INSERT_PADDING_WORDS(7);
+        std::array<StreamOutBuffer, 4> vgt_strmout_buffers;
+        INSERT_PADDING_WORDS(10);
         u32 vgt_gs_max_vert_out : 11;
         INSERT_PADDING_WORDS(6);
         ShaderStageEnable stage_enable;

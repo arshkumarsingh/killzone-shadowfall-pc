@@ -44,7 +44,8 @@ static constexpr spv::ExecutionMode GetInputPrimitiveType(AmdGpu::PrimitiveType 
 static constexpr spv::ExecutionMode GetOutputPrimitiveType(AmdGpu::GsOutputPrimitiveType type) {
     switch (type) {
     case AmdGpu::GsOutputPrimitiveType::PointList:
-        return spv::ExecutionMode::OutputVertices;
+        // gow3: was OutputVertices, a mode that takes a count: invalid SPIR-V for point output.
+        return spv::ExecutionMode::OutputPoints;
     case AmdGpu::GsOutputPrimitiveType::LineStrip:
         return spv::ExecutionMode::OutputLineStrip;
     case AmdGpu::GsOutputPrimitiveType::TriangleStrip:
@@ -324,6 +325,9 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     }
     if (stage == SwStage::Geometry) {
         ctx.AddCapability(spv::Capability::Geometry);
+        if (!info.gs_copy_data.xfb_outputs.empty()) {
+            ctx.AddCapability(spv::Capability::TransformFeedback); // gow3 (stream-out)
+        }
     }
     if (info.hw_stage == HwStage::Fragment) {
         if (profile.supports_amd_shader_explicit_vertex_parameter) {
@@ -449,6 +453,9 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
                              ctx.runtime_info.hw.gs.output_vertices);
         ctx.AddExecutionMode(main, spv::ExecutionMode::Invocations,
                              ctx.runtime_info.hw.gs.num_invocations);
+        if (!info.gs_copy_data.xfb_outputs.empty()) {
+            ctx.AddExecutionMode(main, spv::ExecutionMode::Xfb); // gow3 (stream-out)
+        }
         break;
     default:
         UNREACHABLE_MSG("Stage {}", u32(info.hw_stage));

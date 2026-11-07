@@ -763,6 +763,18 @@ void EmitContext::DefineOutputs() {
             Name(id, fmt::format("out_attr{}", attr_id));
             output_params[attr_id] = GetAttributeInfo(AmdGpu::NumberFormat::Float, id, 4, true);
         }
+        // gow3 (stream-out): what the copy shader streams out, captured by transform feedback
+        // (the fragment shader reads none of these locations).
+        for (const auto& xfb : info.gs_copy_data.xfb_outputs) {
+            const Id id{DefineOutput(F32[xfb.num_components], xfb.param)};
+            Name(id, fmt::format("xfb{}_{}", xfb.buffer, xfb.byte_offset));
+            Decorate(id, spv::Decoration::XfbBuffer, xfb.buffer);
+            Decorate(id, spv::Decoration::XfbStride,
+                     runtime_info.hw.gs.xfb_strides[xfb.buffer] * 4u);
+            Decorate(id, spv::Decoration::Offset, xfb.byte_offset);
+            output_params[xfb.param] =
+                GetAttributeInfo(AmdGpu::NumberFormat::Float, id, xfb.num_components, true);
+        }
         break;
     }
     case SwStage::Compute:

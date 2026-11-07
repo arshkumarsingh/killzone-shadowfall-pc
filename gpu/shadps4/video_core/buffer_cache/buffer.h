@@ -84,8 +84,10 @@ struct UniqueBuffer {
 };
 
 struct Buffer {
+    /// gow3: `extra_usage` is added to AllFlags (the stream-out counters: vk_stream_out.h).
     explicit Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
-                    MemoryType mem_type, std::string_view debug_name = "");
+                    MemoryType mem_type, std::string_view debug_name = "",
+                    vk::BufferUsageFlags extra_usage = {});
 
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;

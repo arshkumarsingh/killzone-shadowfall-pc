@@ -34,6 +34,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/renderer_vulkan/vk_stream_out.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -256,6 +257,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     camera_motion->SetObjectMotion(object_motion.get());
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
                                                   *camera_motion, *scene_targets);
+    if (instance.IsTransformFeedbackSupported()) {
+        stream_out = std::make_unique<StreamOut>(instance, runtime, buffer_cache, texture_cache,
+                                                 memory);
+    }
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -1325,6 +1330,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (is_indexed) {
         EmitIndexBuffer();
     }
+    // gow3 (stream-out): the guest buffers the draw captures into (vk_stream_out.h).
+    const XfbDraw xfb = stream_out && regs.vgt_strmout_config.raw
+                            ? stream_out->Prepare(regs, needs_barrier)
+                            : XfbDraw{};
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -1450,12 +1459,21 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }
         };
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-        draw();
+        if (xfb.active) [[unlikely]] {
+            xfb.Begin(cmdbuf);
+            draw();
+            xfb.End(cmdbuf);
+        } else {
+            draw();
+        }
         if (square) [[unlikely]] {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, square);
             draw();
         }
     });
+    if (xfb.active) [[unlikely]] {
+        stream_out->Finish(xfb);
+    }
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
@@ -1549,6 +1567,10 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
     }
+    // gow3 (stream-out): as in DrawRecord.
+    const XfbDraw xfb = stream_out && Regs().vgt_strmout_config.raw
+                            ? stream_out->Prepare(Regs(), needs_barrier)
+                            : XfbDraw{};
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -1582,6 +1604,10 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
                 break;
             }
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, bound);
+            const bool capture = xfb.active && bound == handle;
+            if (capture) [[unlikely]] {
+                xfb.Begin(cmdbuf);
+            }
             if (is_indexed) {
                 if (counts) {
                     cmdbuf.drawIndexedIndirectCount(args, args_offset, counts, counts_offset, max_count,
@@ -1594,8 +1620,14 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
             } else {
                 cmdbuf.drawIndirect(args, args_offset, max_count, stride);
             }
+            if (capture) [[unlikely]] {
+                xfb.End(cmdbuf);
+            }
         }
     });
+    if (xfb.active) [[unlikely]] {
+        stream_out->Finish(xfb);
+    }
     DebugState.IncDrawCall();
 
     ResetBindings(false);
@@ -3724,6 +3756,14 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     u32 value;
     std::memcpy(&value, gds_buf->mapped_data.data() + gds_offset, sizeof(u32));
     return value;
+}
+
+void Rasterizer::StreamOutBufferUpdate(const AmdGpu::PM4CmdStrmoutBufferUpdate& packet) {
+    if (!stream_out) {
+        return;
+    }
+    DrainDrawPipe(DrawPipe::ReasonRasterizer);
+    stream_out->BufferUpdate(packet);
 }
 
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {

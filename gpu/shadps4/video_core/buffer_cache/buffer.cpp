@@ -228,13 +228,18 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
 }
 
 Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
-               MemoryType mem_type_, std::string_view debug_name)
+               MemoryType mem_type_, std::string_view debug_name,
+               vk::BufferUsageFlags extra_usage)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
       buffer{instance.GetDevice(), instance.GetAllocator()} {
 
+    // gow3 (stream-out): guest memory (the sparse arenas) can be a transform feedback target.
+    if (mem_type == MemoryType::Sparse && instance.IsTransformFeedbackSupported()) {
+        extra_usage |= vk::BufferUsageFlagBits::eTransformFeedbackBufferEXT;
+    }
     vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
-        .usage = AllFlags,
+        .usage = AllFlags | extra_usage,
         .sharingMode = vk::SharingMode::eExclusive,
     };
     VmaAllocationInfo alloc_info{};

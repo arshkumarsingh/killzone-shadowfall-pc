@@ -1307,12 +1307,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::StrmoutBufferUpdate: {
                 const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
-                LOG_WARNING(Render_Vulkan,
-                            "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
-                            "source_select = {}, buffer_select = {}",
-                            strmout->update_memory.Value(),
-                            magic_enum::enum_name(strmout->source_select.Value()),
-                            strmout->buffer_select.Value());
+                // gow3 (stream-out): the offsets live on the GPU (vk_stream_out.h). Not a
+                // pipelined packet: the draw recording thread has run dry here.
+                if (rasterizer) {
+                    rasterizer->StreamOutBufferUpdate(*strmout);
+                }
+                regs.cp_strmout_cntl.offset_update_done = 1;
                 break;
             }
             case PM4ItOpcode::GetLodStats: {

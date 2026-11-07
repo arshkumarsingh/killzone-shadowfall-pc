@@ -303,6 +303,11 @@ public:
         return features.tessellationShader;
     }
 
+    /// gow3 (stream-out): VK_EXT_transform_feedback is enabled (GOW3_STREAMOUT, vk_stream_out.h).
+    bool IsTransformFeedbackSupported() const {
+        return transform_feedback;
+    }
+
     /// Returns true when the shaderSubgroupClock feature of
     /// gow3: the FSR 4 v07 INT8/DOT4 shaders can run (Float16, Int8, Int16, packed int8 dot
     /// products, linear compute derivatives, extended storage image formats).
@@ -578,6 +583,7 @@ private:
     bool vertex_input_dynamic_state{};
     bool list_restart{};
     bool provoking_vertex{};
+    bool transform_feedback{}; // gow3 (stream-out)
     bool shader_stencil_export{};
     bool image_load_store_lod{};
     bool amd_gcn_shader{};

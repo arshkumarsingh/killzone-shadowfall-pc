@@ -21,6 +21,7 @@
 
 namespace AmdGpu {
 struct Liverpool;
+struct PM4CmdStrmoutBufferUpdate;
 }
 
 namespace Core {
@@ -30,6 +31,7 @@ class MemoryManager;
 namespace Vulkan {
 
 class GraphicsPipeline;
+class StreamOut;
 class Runtime;
 
 class Rasterizer {
@@ -97,6 +99,8 @@ public:
 
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    /// gow3 (stream-out): IT_STRMOUT_BUFFER_UPDATE (vk_stream_out.h). GPU command thread.
+    void StreamOutBufferUpdate(const AmdGpu::PM4CmdStrmoutBufferUpdate& packet);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// GPU thread, before a write the guest can observe (see Scheduler::WaitHostCopies).
@@ -363,6 +367,7 @@ private:
     PipelineCache pipeline_cache;
     std::unique_ptr<DrawPreparation> draw_prep;
     std::unique_ptr<CameraMotion> camera_motion; // gow3: motion vectors (docs/upscaler.md)
+    std::unique_ptr<StreamOut> stream_out;       // gow3: GCN stream-out (vk_stream_out.h)
     std::unique_ptr<SceneTargets> scene_targets;
     bool scene_started = false;
     std::unique_ptr<ObjectMotion> object_motion;

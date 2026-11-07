@@ -91,6 +91,13 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
     case HwStage::Geometry: {
         const auto& gs_info = runtime_info.hw.gs;
         info.gs_copy_data = Shader::ParseCopyShader(gs_info.vs_copy);
+        // gow3 (stream-out): the dwords the copy shader stores to stream-out buffers become
+        // transform feedback outputs after the exported parameters.
+        if (gs_info.xfb_buffer_mask) {
+            info.gs_copy_data.xfb_outputs =
+                Shader::BuildXfbOutputs(info.gs_copy_data, gs_info.xfb_buffer_mask,
+                                        gs_info.xfb_strides, info.gs_copy_data.num_attrs);
+        }
 
         u32 dwords_per_vertex = gs_info.out_vertex_data_size;
         if (info.gs_copy_data.num_comps && info.gs_copy_data.num_comps > dwords_per_vertex) {
@@ -137,7 +144,21 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                 const auto output_size = gs_info.output_vertices * dwords_per_vertex * sizeof(u32);
 
                 const auto vc_read_ofs = (((offset / comp_ofs) * comp_ofs) % output_size) * 16u;
+                // gow3 (stream-out): the same ring dword, as the copy shader stores it.
+                for (const auto& xfb : info.gs_copy_data.xfb_outputs) {
+                    for (u32 c = 0; c < xfb.num_components; ++c) {
+                        if (xfb.ring_offsets[c] == vc_read_ofs) {
+                            ir.SetAttribute(IR::Attribute::Param0 + xfb.param, data, c);
+                        }
+                    }
+                }
                 const auto& it = info.gs_copy_data.attr_map.find(vc_read_ofs);
+                if (it == info.gs_copy_data.attr_map.cend() &&
+                    !info.gs_copy_data.so_stores.empty()) {
+                    // Only streamed out (or not read at all) by a stream-out copy shader.
+                    inst.Invalidate();
+                    break;
+                }
                 ASSERT(it != info.gs_copy_data.attr_map.cend());
                 const auto& [attr, comp] = it->second;
 
