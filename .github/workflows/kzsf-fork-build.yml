@@ -48,6 +48,10 @@ jobs:
           mkdir -p out
           clang -std=c11 -O2 -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_sema_stress.c src/runtime_sema.c -o out/sema-stress.exe
           for i in $(seq 1 20); do timeout 60 out/sema-stress.exe || { echo "run $i failed or hung"; exit 1; }; done
+      # The executable's icon comes from the player's dump (make_kzsf_icon.py) and is not in git;
+      # this test build embeds the repository's launcher icon instead (the window shows the game's).
+      - name: Stand-in executable icon
+        run: '[ -f launcher/kzsf.ico ] || cp launcher/gow3.ico launcher/kzsf.ico'
       - name: Build
         run: bash build.sh
       - name: Collect the executable and its DLLs
