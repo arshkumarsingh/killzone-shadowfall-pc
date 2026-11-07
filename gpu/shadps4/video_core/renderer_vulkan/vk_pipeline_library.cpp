@@ -59,20 +59,23 @@ const vk::BaseInStructure* Next(const void* p_next) {
 } // namespace
 
 /// XXH3-128 of the state a library part reads, field by field (struct padding is not hashed).
+/// The fields are gathered and hashed once (no streaming state: XXH3_state_t is only complete
+/// with XXH_STATIC_LINKING_ONLY).
 class PartHasher {
 public:
     PartHasher() {
-        XXH3_128bits_reset(&state);
+        bytes.reserve(1024);
     }
     template <typename T>
         requires std::is_trivially_copyable_v<T> && (!std::is_pointer_v<T>)
     void Add(const T& value) {
         static_assert(std::has_unique_object_representations_v<T> || std::is_floating_point_v<T>,
                       "hash scalars only");
-        XXH3_128bits_update(&state, &value, sizeof(value));
+        Bytes(&value, sizeof(value));
     }
     void Bytes(const void* data, size_t size) {
-        XXH3_128bits_update(&state, data, size);
+        const auto* first = static_cast<const u8*>(data);
+        bytes.insert(bytes.end(), first, first + size);
     }
     void Flag(VkFlags flags) {
         Add(u32(flags));
@@ -87,13 +90,13 @@ public:
     void Handle(u64 value) {
         Add(value);
     }
-    PipelineLibraries::Key Finish() {
-        const XXH128_hash_t hash = XXH3_128bits_digest(&state);
+    PipelineLibraries::Key Finish() const {
+        const XXH128_hash_t hash = XXH3_128bits(bytes.data(), bytes.size());
         return {hash.low64, hash.high64};
     }
 
 private:
-    XXH3_state_t state;
+    std::vector<u8> bytes;
 };
 
 namespace {
