@@ -222,10 +222,10 @@ private:
     void PublishShaders(bool wait = false);
     void PublishGraphics(bool wait = false);
     /// gow3: GOW3_GPL fast link (vk_pipeline_library.h), GPU thread: the pipeline for `sel`
-    /// linked now from ready libraries, else null (a fast-link job may be queued; `urgent` when
-    /// the optimized compile should jump the queue: its binary is on disk).
-    const GraphicsPipeline* TryFastLink(bool& urgent);
-    void QueueFastLink();
+    /// linked now from ready libraries, else null. No binary check on this thread.
+    const GraphicsPipeline* TryFastLink();
+    /// gow3: GOW3_GPL: an urgent job sharing `source`'s snapshot (the optimized compile's).
+    void QueueFastLink(const std::shared_ptr<AsyncGraphicsCompilation>& source);
     void PublishFastLinks(bool wait = false);
     bool WaitForFastLink();
     void FinishCompilations();

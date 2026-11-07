@@ -444,6 +444,8 @@ GraphicsPipeline::GraphicsPipeline(
     if (linker && !pipe) {
         return; // not linked (PipelineLinker::outcome): the caller drops this object
     }
+    // A fast-link job may restore the optimized pipeline from its binary instead.
+    fast_linked = linker && linker->outcome == PipelineLinker::Outcome::Linked;
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);

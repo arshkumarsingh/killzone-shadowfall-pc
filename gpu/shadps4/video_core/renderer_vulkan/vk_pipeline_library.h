@@ -52,6 +52,12 @@ struct AsyncGraphicsCompilation;
 /// file keeps between sessions. The optimized pipeline keeps using the binary cache, so the next
 /// session restores it instead of linking.
 ///
+/// The GPU thread does no binary check and builds nothing unless both stages already have a
+/// library (MayLink, an in-memory index): with a warm binary cache it costs what the build
+/// without fast link costs. The urgent fast-link job decides on a worker: a binary on disk is
+/// restored there (the optimized compile then skips), otherwise it compiles the missing parts
+/// and links while the optimized compile runs.
+///
 /// GOW3_GPL=0 leaves the extension out of the device (vk_instance.cpp) and behaves as before.
 /// GOW3_GPL_MAX_LIBRARIES (default 6000) caps the libraries kept (a full play needs ~4,200).
 class PipelineLibraries {
@@ -79,6 +85,9 @@ public:
         return generation.load(std::memory_order_acquire);
     }
     [[nodiscard]] size_t Count() const;
+    /// GPU thread gate for a probe: every program module of the pipeline has a ready library
+    /// of its part (pre-rasterization or fragment), for some state. Two set lookups.
+    [[nodiscard]] bool MayLink(std::span<const vk::ShaderModule> modules) const;
 
     /// Library work on any thread, read by the report.
     struct Counters {
@@ -89,8 +98,8 @@ public:
         std::atomic<u32> failed{};      ///< a part or a link the driver refused
         std::atomic<u32> links{};
         std::atomic<u64> link_ns{}, link_worst_ns{};
-        std::atomic<u64> probe_key_ns{};  ///< pipeline binary keys computed by probes
-        std::atomic<u32> probe_keys{};
+        std::atomic<u64> restore_ns{};  ///< fast-link jobs' binary restores and misses (worker)
+        std::atomic<u32> restore_tries{};
     };
     Counters counters;
 
@@ -101,9 +110,11 @@ private:
         bool done = false;
     };
     /// The ready library for `key`, or null. Creates it from `info` on this thread when nobody
-    /// has (`may_create`), waits for another thread's creation (`may_wait`).
+    /// has (`may_create`), waits for another thread's creation (`may_wait`). A created stage
+    /// part indexes `program_modules` for MayLink.
     vk::Pipeline Acquire(Part part, const Key& key, const vk::GraphicsPipelineCreateInfo& info,
-                         vk::PipelineCache cache, bool may_create, bool may_wait);
+                         vk::PipelineCache cache, bool may_create, bool may_wait,
+                         std::span<const u64> program_modules = {});
     vk::ResultValue<vk::UniquePipeline> CreateLibrary(Part part,
                                                       const vk::GraphicsPipelineCreateInfo& info,
                                                       vk::PipelineCache cache) const;
@@ -114,6 +125,8 @@ private:
     mutable std::mutex mutex;
     std::condition_variable cv;
     std::array<std::unordered_map<Key, std::unique_ptr<Entry>, KeyHash>, NumParts> entries;
+    /// Program module handles with a ready pre-rasterization / fragment library (MayLink).
+    tsl::robin_set<u64> pre_raster_modules, fragment_modules;
     size_t total = 0;
     std::atomic<u64> generation{0};
 };
@@ -125,16 +138,17 @@ class PipelineLinker {
 public:
     enum class Mode : u8 {
         /// GPU thread: link only when both shader parts are ready; the two cheap parts may be
-        /// created here. Never waits, never compiles a shader.
+        /// created here. Never waits, never compiles a shader, never touches the binary cache.
         Probe,
-        /// Compiler worker: create every missing part, then link.
+        /// Compiler worker: restore the pipeline binary when one is on disk (`restore_first`),
+        /// else create every missing part and link.
         Compile,
     };
     enum class Outcome : u8 {
         None,
         Linked,
         MissingLibraries, ///< Probe: a shader part is not ready
-        BinaryCached,     ///< Probe: a pipeline binary is on disk, restoring it is cheaper
+        Restored,         ///< Compile: restored from a pipeline binary, an optimized pipeline
         Unsupported,      ///< state the part hash does not know
         Cancelled,        ///< Compile: the optimized pipeline was published first
         Failed,
@@ -152,18 +166,22 @@ public:
                                                bool square);
 
     Outcome outcome = Outcome::None;
-    bool check_binary = false;              ///< Probe: BinaryCached when one is on disk
+    bool restore_first = false;              ///< Compile: try the pipeline binary first
     const std::atomic<bool>* cancel = nullptr; ///< Compile: stop before the next shader part
 
 private:
     bool HashPart(PipelineLibraries::Part part, const GraphicsPipeline& pipeline,
                   const vk::GraphicsPipelineCreateInfo& info, PipelineLibraries::Key& out);
     bool HashModule(PartHasher& h, const vk::PipelineShaderStageCreateInfo& stage);
-    bool PipelineBinaryOnDisk(const vk::GraphicsPipelineCreateInfo& info) const;
+    /// The binary cache's own path for `info`; `restore_only` never compiles.
+    vk::ResultValue<vk::UniquePipeline> Cached(const vk::GraphicsPipelineCreateInfo& info,
+                                               bool restore_only) const;
 
     PipelineLibraries& libraries;
     Mode mode;
     vk::PipelineCache cache;
+    GraphicsPipelineKey pipeline_key;
+    bool restored = false; ///< the main pipeline came from a binary: the squaring pass too
     std::array<u64, MaxShaderStages> stage_hashes{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     const GraphicsPipeline::SerializationSupport& sdata;
@@ -180,10 +198,8 @@ struct FastLinkState {
     PipelineLibraries libraries;
     /// Fast-link jobs in flight (urgent queue), by pipeline key.
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<AsyncGraphicsCompilation>> pending;
-    /// Keys never fast-linked: a binary on disk (their optimized compile is queued urgent),
-    /// unsupported state, or a failed link.
+    /// Keys never fast-linked: unsupported state or a failed link.
     tsl::robin_set<GraphicsPipelineKey> ineligible;
-    tsl::robin_set<GraphicsPipelineKey> urgent;
     /// Probe found a shader part missing at this library generation.
     tsl::robin_map<GraphicsPipelineKey, u64> missing;
     /// Fast-linked pipelines replaced by the optimized one, or never used (the optimized came
@@ -202,13 +218,22 @@ struct FastLinkState {
     };
     // Report counters, reset by each report.
     u32 linked_now = 0, linked_async = 0, replaced = 0, optimized_first = 0;
-    u32 binary_first = 0, unsupported = 0, failed = 0;
+    u32 restored = 0, unsupported = 0, failed = 0, probes = 0;
     u32 pending_shader = 0, pending_pipeline = 0;
+    /// GPU-thread time in fast-link decisions (gate, probe, job queueing, publication).
+    u32 gpu_calls = 0;
+    u64 gpu_ns = 0, gpu_worst_ns = 0;
     Timing ready_shader, ready_fast, ready_optimized;
     std::array<u32, PipelineLibraries::NumParts> compiled_seen{};
     std::array<u64, PipelineLibraries::NumParts> compile_ns_seen{};
-    u32 reused_seen = 0, links_seen = 0, probe_keys_seen = 0;
-    u64 link_ns_seen = 0, probe_key_ns_seen = 0;
+    u32 reused_seen = 0, links_seen = 0, restore_tries_seen = 0;
+    u64 link_ns_seen = 0, restore_ns_seen = 0;
+
+    void AddGpuTime(u64 ns) {
+        ++gpu_calls;
+        gpu_ns += ns;
+        gpu_worst_ns = ns > gpu_worst_ns ? ns : gpu_worst_ns;
+    }
     std::chrono::steady_clock::time_point last_report{};
 
     /// Every 5 s with activity: "Shaders: fast link ..." and "Shaders: ready after ...".

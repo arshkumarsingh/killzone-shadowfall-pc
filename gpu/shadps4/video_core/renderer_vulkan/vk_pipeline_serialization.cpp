@@ -271,45 +271,20 @@ void ReportPipelineBinaryCache() {
                 binary_load_ns.load() / 1e6 / std::max(u64{1}, hits + misses));
 }
 
-bool PipelineBinaryOnDisk(vk::Device device, const vk::GraphicsPipelineCreateInfo& info,
-                          const vk::PipelineBinaryKeyKHR& global_key,
-                          const std::filesystem::path& directory) {
-    using namespace PipelineBinaryCache;
-    if (!global_key.keySize || !EmulatorSettings.IsPipelineCacheEnabled()) {
-        return false;
-    }
-    // The key as CreateCachedGraphicsPipeline computes it (capture flag included).
-    vk::PipelineCreateFlags2CreateInfoKHR flags{
-        .pNext = info.pNext,
-        .flags = vk::PipelineCreateFlags2{static_cast<VkPipelineCreateFlags>(info.flags)} |
-                 vk::PipelineCreateFlagBits2::eCaptureDataKHR,
-    };
-    auto captured_info = info;
-    captured_info.pNext = &flags;
-    vk::PipelineCreateInfoKHR key_info{.pNext = &captured_info};
-    vk::PipelineBinaryKeyKHR pipeline_key;
-    if (device.getPipelineKeyKHR(&key_info, &pipeline_key) != vk::Result::eSuccess) {
-        return false;
-    }
-    const auto pipeline_id = BinaryKey(pipeline_key);
-    if (!ValidKey(BinaryKey(global_key)) || !ValidKey(pipeline_id)) {
-        return false;
-    }
-    std::string name;
-    for (const auto byte : pipeline_id) {
-        name += fmt::format("{:02x}", byte);
-    }
-    std::error_code error;
-    return std::filesystem::is_regular_file(directory / (name + ".bin"), error);
-}
-
 vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
     vk::Device device, vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info,
     const GraphicsPipelineKey& key, const vk::PipelineBinaryKeyKHR& global_key,
-    const std::filesystem::path& directory) {
+    const std::filesystem::path& directory, bool restore_only) {
     using namespace PipelineBinaryCache;
     const auto& dispatch = VULKAN_HPP_DEFAULT_DISPATCHER;
     const bool enabled = global_key.keySize && EmulatorSettings.IsPipelineCacheEnabled();
+    // gow3: GOW3_GPL: `restore_only` returns eIncomplete instead of compiling (vk_pipeline_library).
+    const auto not_restored = [] {
+        return vk::ResultValue<vk::UniquePipeline>{vk::Result::eIncomplete, vk::UniquePipeline{}};
+    };
+    if (!enabled && restore_only) {
+        return not_restored();
+    }
     const auto create = [&](vk::PipelineCache used_cache, const auto& used_info, bool restored) {
         const auto started = std::chrono::steady_clock::now();
         auto result = device.createGraphicsPipelineUnique(used_cache, used_info);
@@ -355,6 +330,9 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
     if (key_result != vk::Result::eSuccess ||
         !ValidKey(global) || !ValidKey(BinaryKey(pipeline_key))) {
         ++binary_errors;
+        if (restore_only) {
+            return not_restored();
+        }
         ++binary_misses;
         return create(cache, info, false);
     }
@@ -429,6 +407,9 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
     } catch (const std::exception&) {
         ++binary_errors;
         destroy();
+    }
+    if (restore_only) {
+        return not_restored(); // the optimized compile counts the miss and saves the binary
     }
     ++binary_misses;
     flags.flags = vk::PipelineCreateFlags2{static_cast<VkPipelineCreateFlags>(info.flags)} |

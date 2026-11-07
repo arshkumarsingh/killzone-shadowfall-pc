@@ -381,6 +381,31 @@ size_t PipelineLibraries::Count() const {
     return total;
 }
 
+bool PipelineLibraries::MayLink(std::span<const vk::ShaderModule> modules) const {
+    if (!enabled) {
+        return false;
+    }
+    std::scoped_lock lock{mutex};
+    if (pre_raster_modules.empty()) {
+        return false; // no library yet this session: the common case with a warm cache
+    }
+    bool any = false;
+    for (size_t i = 0; i < modules.size(); ++i) {
+        if (!modules[i]) {
+            continue;
+        }
+        any = true;
+        const u64 handle =
+            u64(reinterpret_cast<uintptr_t>(static_cast<VkShaderModule>(modules[i])));
+        const auto& index = i == size_t(Shader::SwStage::Fragment) ? fragment_modules
+                                                                   : pre_raster_modules;
+        if (!index.contains(handle)) {
+            return false;
+        }
+    }
+    return any;
+}
+
 vk::ResultValue<vk::UniquePipeline> PipelineLibraries::CreateLibrary(
     Part part, const vk::GraphicsPipelineCreateInfo& info, vk::PipelineCache cache) const {
     vk::GraphicsPipelineLibraryCreateInfoEXT library{.flags = PartFlag(part)};
@@ -436,7 +461,8 @@ vk::ResultValue<vk::UniquePipeline> PipelineLibraries::CreateLibrary(
 
 vk::Pipeline PipelineLibraries::Acquire(Part part, const Key& key,
                                         const vk::GraphicsPipelineCreateInfo& info,
-                                        vk::PipelineCache cache, bool may_create, bool may_wait) {
+                                        vk::PipelineCache cache, bool may_create, bool may_wait,
+                                        std::span<const u64> program_modules) {
     std::unique_lock lock{mutex};
     auto& map = entries[part];
     if (const auto it = map.find(key); it != map.end()) {
@@ -470,6 +496,8 @@ vk::Pipeline PipelineLibraries::Acquire(Part part, const Key& key,
         counters.compile_ns[part].fetch_add(ns, std::memory_order_relaxed);
         AtomicMax(counters.compile_worst_ns[part], ns);
         if (part == PreRaster || part == FragmentShader) {
+            auto& index = part == PreRaster ? pre_raster_modules : fragment_modules;
+            index.insert(program_modules.begin(), program_modules.end());
             generation.fetch_add(1, std::memory_order_release);
         }
     } else {
@@ -486,7 +514,7 @@ PipelineLinker::PipelineLinker(PipelineLibraries& libraries_, Mode mode_, vk::Pi
                                const GraphicsPipelineKey& key,
                                std::span<const vk::ShaderModule> modules_,
                                const GraphicsPipeline::SerializationSupport& sdata_)
-    : libraries{libraries_}, mode{mode_}, cache{cache_}, sdata{sdata_} {
+    : libraries{libraries_}, mode{mode_}, cache{cache_}, pipeline_key{key}, sdata{sdata_} {
     std::ranges::copy(key.stage_hashes, stage_hashes.begin());
     std::copy_n(modules_.begin(), std::min<size_t>(modules_.size(), modules.size()),
                 modules.begin());
@@ -621,19 +649,14 @@ bool PipelineLinker::HashPart(PipelineLibraries::Part part, const GraphicsPipeli
     return ok;
 }
 
-bool PipelineLinker::PipelineBinaryOnDisk(const vk::GraphicsPipelineCreateInfo& info) const {
+vk::ResultValue<vk::UniquePipeline> PipelineLinker::Cached(
+    const vk::GraphicsPipelineCreateInfo& info, bool restore_only) const {
     const auto& instance = libraries.instance;
-    const auto& global = instance.GetPipelineBinaryGlobalKey();
-    if (!global.keySize) {
-        return false;
-    }
-    const auto started = Clock::now();
     const auto directory = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
                            Common::ElfInfo::Instance().GameSerial() / "pipeline-binaries";
-    const bool found = Vulkan::PipelineBinaryOnDisk(instance.GetDevice(), info, global, directory);
-    libraries.counters.probe_key_ns.fetch_add(NsSince(started), std::memory_order_relaxed);
-    libraries.counters.probe_keys.fetch_add(1, std::memory_order_relaxed);
-    return found;
+    return CreateCachedGraphicsPipeline(instance.GetDevice(), cache, info, pipeline_key,
+                                        instance.GetPipelineBinaryGlobalKey(), directory,
+                                        restore_only);
 }
 
 vk::ResultValue<vk::UniquePipeline> PipelineLinker::Create(const GraphicsPipeline& pipeline,
@@ -644,6 +667,26 @@ vk::ResultValue<vk::UniquePipeline> PipelineLinker::Create(const GraphicsPipelin
         outcome = why;
         return vk::ResultValue<vk::UniquePipeline>{vk::Result::eIncomplete, vk::UniquePipeline{}};
     };
+    if (mode == Mode::Compile) {
+        // The main pipeline restored from a binary: its squaring pass the same way (restored,
+        // or compiled and saved as the optimized path would).
+        if (restored) {
+            return Cached(info, !square);
+        }
+        // Worker side of the binary check: one driver key computation and file read, the ones
+        // the optimized compile would make; a hit is the optimized pipeline itself.
+        if (restore_first && !square) {
+            const auto started = Clock::now();
+            auto result = Cached(info, true);
+            libraries.counters.restore_ns.fetch_add(NsSince(started), std::memory_order_relaxed);
+            libraries.counters.restore_tries.fetch_add(1, std::memory_order_relaxed);
+            if (result.result == vk::Result::eSuccess && result.value) {
+                restored = true;
+                outcome = Outcome::Restored;
+                return result;
+            }
+        }
+    }
     std::array<Libs::Key, Libs::NumParts> keys;
     for (u32 part = 0; part < Libs::NumParts; ++part) {
         if (!HashPart(Libs::Part(part), pipeline, info, keys[part])) {
@@ -652,15 +695,11 @@ vk::ResultValue<vk::UniquePipeline> PipelineLinker::Create(const GraphicsPipelin
     }
     std::array<vk::Pipeline, Libs::NumParts> parts{};
     if (mode == Mode::Probe) {
-        // Shader parts: only when ready. The binary check costs a driver key computation, so
-        // it runs only when a link is not possible right now.
+        // Shader parts: only when ready (no compile, no wait, no binary cache on this thread).
         for (const auto part : {Libs::PreRaster, Libs::FragmentShader}) {
             parts[part] = libraries.Acquire(part, keys[part], info, {}, false, false);
         }
         if (!parts[Libs::PreRaster] || !parts[Libs::FragmentShader]) {
-            if (check_binary && !square && PipelineBinaryOnDisk(info)) {
-                return not_linked(Outcome::BinaryCached);
-            }
             return not_linked(Outcome::MissingLibraries);
         }
         // The cheap parts have no shader to compile: made here when missing.
@@ -671,12 +710,28 @@ vk::ResultValue<vk::UniquePipeline> PipelineLinker::Create(const GraphicsPipelin
             }
         }
     } else {
+        // Program modules per stage part, indexed for the GPU thread's MayLink gate.
+        boost::container::static_vector<u64, MaxShaderStages> pre_raster_modules, fragment_modules;
+        for (u32 i = 0; i < MaxShaderStages; ++i) {
+            if (modules[i]) {
+                const u64 handle =
+                    u64(reinterpret_cast<uintptr_t>(static_cast<VkShaderModule>(modules[i])));
+                (i == u32(Shader::SwStage::Fragment) ? fragment_modules : pre_raster_modules)
+                    .push_back(handle);
+            }
+        }
         for (const auto part :
              {Libs::VertexInput, Libs::FragmentOutput, Libs::PreRaster, Libs::FragmentShader}) {
             if (cancel && cancel->load(std::memory_order_relaxed)) {
                 return not_linked(Outcome::Cancelled);
             }
-            parts[part] = libraries.Acquire(part, keys[part], info, cache, true, true);
+            std::span<const u64> indexed;
+            if (part == Libs::PreRaster) {
+                indexed = {pre_raster_modules.data(), pre_raster_modules.size()};
+            } else if (part == Libs::FragmentShader) {
+                indexed = {fragment_modules.data(), fragment_modules.size()};
+            }
+            parts[part] = libraries.Acquire(part, keys[part], info, cache, true, true, indexed);
             if (!parts[part]) {
                 return not_linked(Outcome::Failed);
             }
@@ -737,15 +792,16 @@ void FastLinkState::Report() {
     const u64 link_ns = link_ns_total - link_ns_seen;
     links_seen = links_total;
     link_ns_seen = link_ns_total;
-    const u32 keys_total = c.probe_keys.load(std::memory_order_relaxed);
-    const u64 key_ns_total = c.probe_key_ns.load(std::memory_order_relaxed);
-    const u32 binary_checks = keys_total - probe_keys_seen;
-    const u64 binary_check_ns = key_ns_total - probe_key_ns_seen;
-    probe_keys_seen = keys_total;
-    probe_key_ns_seen = key_ns_total;
+    const u32 tries_total = c.restore_tries.load(std::memory_order_relaxed);
+    const u64 restore_ns_total = c.restore_ns.load(std::memory_order_relaxed);
+    const u32 restore_tries = tries_total - restore_tries_seen;
+    const u64 restore_ns = restore_ns_total - restore_ns_seen;
+    restore_tries_seen = tries_total;
+    restore_ns_seen = restore_ns_total;
 
     const bool fast_activity = linked_now || linked_async || replaced || optimized_first ||
-                               binary_first || unsupported || failed || compiled_any;
+                               restored || unsupported || failed || compiled_any || gpu_calls ||
+                               restore_tries;
     const bool timing_activity = ready_shader.count || ready_fast.count ||
                                  ready_optimized.count || pending_shader || pending_pipeline;
     if (!fast_activity && !timing_activity) {
@@ -754,14 +810,18 @@ void FastLinkState::Report() {
     last_report = now;
     const auto avg = [](u64 ns, u32 count) { return count ? double(ns) / 1e6 / count : 0.0; };
     if (libraries.Enabled() && fast_activity) {
+        // GPU thread: the gate, probes, job queueing and publication of fast links. Worker:
+        // the binary restores tried by fast-link jobs (they replace the GPU thread's checks).
         std::printf(
             "Shaders: fast link: %u linked at once, %u after compiling libraries, %u swapped for "
-            "the optimized pipeline, %u optimized first; %u restored from binaries instead (%u "
-            "binary checks, avg %.2f ms), %u not linkable, %u failed; libraries compiled: %u "
+            "the optimized pipeline, %u optimized first; %u restored from binaries on workers "
+            "(%u tries, avg %.2f ms), %u not linkable, %u failed; GPU thread %.2f ms in %u "
+            "fast-link steps (worst %.2f ms, %u probes); libraries compiled: %u "
             "pre-raster (avg %.1f ms), %u fragment (avg %.1f ms), %u vertex input, %u output, %u "
             "reused; %u links (avg %.2f ms, worst %.2f ms); %zu libraries, %zu pipelines kept\n",
-            linked_now, linked_async, replaced, optimized_first, binary_first, binary_checks,
-            avg(binary_check_ns, binary_checks), unsupported, failed,
+            linked_now, linked_async, replaced, optimized_first, restored, restore_tries,
+            avg(restore_ns, restore_tries), unsupported, failed, double(gpu_ns) / 1e6, gpu_calls,
+            double(gpu_worst_ns) / 1e6, probes,
             compiled[PipelineLibraries::PreRaster],
             avg(compile_ns[PipelineLibraries::PreRaster], compiled[PipelineLibraries::PreRaster]),
             compiled[PipelineLibraries::FragmentShader],
@@ -785,7 +845,9 @@ void FastLinkState::Report() {
     }
     std::fflush(stdout);
     linked_now = linked_async = replaced = optimized_first = 0;
-    binary_first = unsupported = failed = 0;
+    restored = unsupported = failed = probes = 0;
+    gpu_calls = 0;
+    gpu_ns = gpu_worst_ns = 0;
     pending_shader = pending_pipeline = 0;
     ready_shader = ready_fast = ready_optimized = {};
 }
