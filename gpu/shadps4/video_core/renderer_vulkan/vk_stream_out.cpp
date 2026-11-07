@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <span>
 
 #include "core/memory.h"
@@ -90,7 +91,106 @@ void PrintCode(const char* name, const AmdGpu::ShaderProgram& program) {
     }
 }
 
+u64 Mix(u64 seed, u64 value) {
+    return seed ^ (value + 0x9E3779B97F4A7C15ull + (seed << 6) + (seed >> 2));
+}
+
+/// Stream-out buffers (stream 0) and their vertex strides, as the geometry shader is specialized
+/// (vk_pipeline_cache.cpp: BuildRuntimeInfo).
+std::pair<u32, std::array<u32, 4>> BuffersOf(const AmdGpu::Regs& regs) {
+    const u32 mask = regs.vgt_strmout_buffer_config.stream_0_buf_en;
+    std::array<u32, 4> strides{};
+    for (u32 b = 0; b < 4; ++b) {
+        strides[b] = (mask >> b) & 1 ? regs.vgt_strmout_buffers[b].vtx_stride : 0;
+    }
+    return {mask, strides};
+}
+
 } // namespace
+
+std::optional<bool> StreamOutPipelineUsable(const AmdGpu::Regs& regs, bool cached_only) {
+    static std::mutex mutex;
+    static std::unordered_map<u64, bool> verdicts;
+    const AmdGpu::ShaderProgram* programs[] = {&regs.vs_program, &regs.gs_program,
+                                               &regs.es_program};
+    for (const auto* program : programs) {
+        if (!program->Address<const u32*>()) {
+            return false; // refused later anyway (bind_stage): no program
+        }
+    }
+    const auto [mask, strides] = BuffersOf(regs);
+    u64 key = 0;
+    for (const auto* program : programs) {
+        key = Mix(key, AmdGpu::GetParams(*program).hash);
+    }
+    key = Mix(key, mask);
+    for (const u32 stride : strides) {
+        key = Mix(key, stride);
+    }
+    std::scoped_lock lock{mutex};
+    if (const auto it = verdicts.find(key); it != verdicts.end()) {
+        return it->second;
+    }
+    if (cached_only) {
+        return std::nullopt;
+    }
+    // The code first: it is in the log even when the parse below goes wrong.
+    std::printf("Stream-out: new pipeline. VGT_STRMOUT_CONFIG %#x, BUFFER_CONFIG %#x, strides "
+                "%u/%u/%u/%u dwords, buffer sizes %u/%u/%u/%u dwords\n",
+                regs.vgt_strmout_config.raw,
+                *reinterpret_cast<const u32*>(&regs.vgt_strmout_buffer_config), strides[0],
+                strides[1], strides[2], strides[3], regs.vgt_strmout_buffers[0].size,
+                regs.vgt_strmout_buffers[1].size, regs.vgt_strmout_buffers[2].size,
+                regs.vgt_strmout_buffers[3].size);
+    PrintCode("copy", regs.vs_program);
+    PrintCode("gs", regs.gs_program);
+    PrintCode("es", regs.es_program);
+    std::fflush(stdout);
+
+    const auto params = AmdGpu::GetParams(regs.vs_program);
+    const auto data = Shader::ParseCopyShader(params.code);
+    u32 dropped = 0;
+    std::vector<Shader::XfbOutput> outputs;
+    if (data.failure.empty() && data.so_failure.empty()) {
+        outputs = Shader::BuildXfbOutputs(data, mask, strides, data.num_attrs, &dropped);
+    }
+    char reason[320]{};
+    if (!data.failure.empty()) {
+        std::snprintf(reason, sizeof(reason), "the copy shader could not be followed: %s",
+                      data.failure.c_str());
+    } else if (!data.so_failure.empty()) {
+        std::snprintf(reason, sizeof(reason), "a stream-out store the capture cannot reproduce: %s",
+                      data.so_failure.c_str());
+    } else if (data.so_stores.empty()) {
+        std::snprintf(reason, sizeof(reason), "no stream-out stores found in the copy shader");
+    } else if (data.output_vertices == 0) {
+        std::snprintf(reason, sizeof(reason), "the copy shader's GSVS ring layout was not found");
+    } else if (dropped || outputs.empty()) {
+        std::snprintf(reason, sizeof(reason),
+                      "%u of %zu stores have no buffer, fall past their vertex stride or run out "
+                      "of output slots",
+                      dropped, data.so_stores.size());
+    }
+    const bool usable = reason[0] == '\0';
+    verdicts.emplace(key, usable);
+    if (!usable) {
+        std::printf("Stream-out: copy shader %016llx refused (its draws are skipped as before): "
+                    "%s\n",
+                    static_cast<unsigned long long>(params.hash), reason);
+    } else {
+        std::printf("Stream-out: copy shader %016llx: %zu stores through %zu V#s, %u exported "
+                    "parameters; capturing",
+                    static_cast<unsigned long long>(params.hash), data.so_stores.size(),
+                    data.so_sharps.size(), data.num_attrs);
+        for (const auto& output : outputs) {
+            std::printf(" [param %u buffer %u +%u x%u]", output.param, output.buffer,
+                        output.byte_offset, output.num_components);
+        }
+        std::printf("\n");
+    }
+    std::fflush(stdout);
+    return usable;
+}
 
 void XfbDraw::Begin(vk::CommandBuffer cmdbuf) const {
     for (u32 b = 0; b < num_counters; ++b) {
@@ -126,16 +226,15 @@ const StreamOut::Layout& StreamOut::LayoutFor(const AmdGpu::Regs& regs) {
     if (inserted) {
         layout.data = Shader::ParseCopyShader(params.code);
     }
-    // As the geometry shader was specialized (vk_pipeline_cache.cpp: BuildRuntimeInfo).
-    const u32 mask = regs.vgt_strmout_buffer_config.stream_0_buf_en;
-    std::array<u32, 4> strides{};
-    for (u32 b = 0; b < 4; ++b) {
-        strides[b] = (mask >> b) & 1 ? regs.vgt_strmout_buffers[b].vtx_stride : 0;
-    }
+    const auto [mask, strides] = BuffersOf(regs);
     if (inserted || mask != layout.buffer_mask || strides != layout.strides) {
         layout.buffer_mask = mask;
         layout.strides = strides;
-        layout.outputs = Shader::BuildXfbOutputs(layout.data, mask, strides, layout.data.num_attrs);
+        layout.outputs.clear();
+        if (layout.data.failure.empty() && layout.data.so_failure.empty()) {
+            layout.outputs =
+                Shader::BuildXfbOutputs(layout.data, mask, strides, layout.data.num_attrs);
+        }
     }
     return layout;
 }
@@ -328,10 +427,7 @@ void StreamOut::LogFirstDraw(const AmdGpu::Regs& regs, const Layout& layout,
                 cb ? cb.Height() : 0u, cb ? cb.NumSlices() : 0u,
                 cb ? static_cast<unsigned>(cb.GetDataFmt()) : 0u,
                 static_cast<unsigned long long>(db.DepthValid() ? db.DepthAddress() : 0));
-    PrintCode("copy", regs.vs_program);
-    PrintCode("gs", regs.gs_program);
-    PrintCode("es", regs.es_program);
-    std::fflush(stdout);
+    std::fflush(stdout); // the programs were printed with the pipeline (StreamOutPipelineUsable)
 }
 
 } // namespace Vulkan

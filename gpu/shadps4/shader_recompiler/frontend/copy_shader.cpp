@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdarg>
 #include <cstdio>
 #include <optional>
 #include <set>
@@ -46,7 +47,8 @@ std::optional<u32> ConstantOf(const Gcn::InstOperand& op, const SgprConstants& s
     case Gcn::OperandField::SignedConstIntPos:
         return op.code - Gcn::OperandFieldRange::SignedConstIntPosMin + 1;
     case Gcn::OperandField::SignedConstIntNeg:
-        return static_cast<u32>(-static_cast<s32>(op.code - Gcn::OperandFieldRange::SignedConstIntNegMin + 1));
+        return static_cast<u32>(
+            -static_cast<s32>(op.code - Gcn::OperandFieldRange::SignedConstIntNegMin + 1));
     case Gcn::OperandField::LiteralConst:
         return op.code;
     case Gcn::OperandField::ScalarGPR:
@@ -77,6 +79,11 @@ bool IsSmrdLoad(Gcn::Opcode opcode) {
     return opcode >= Gcn::Opcode::S_LOAD_DWORD && opcode <= Gcn::Opcode::S_BUFFER_LOAD_DWORDX16;
 }
 
+bool IsMtbufStore(Gcn::Opcode opcode) {
+    return opcode >= Gcn::Opcode::TBUFFER_STORE_FORMAT_X &&
+           opcode <= Gcn::Opcode::TBUFFER_STORE_FORMAT_XYZW;
+}
+
 /// Number of dwords a buffer store writes, 0 for other instructions.
 u32 StoreDwords(const Gcn::GcnInst& inst) {
     using Gcn::Opcode;
@@ -85,79 +92,67 @@ u32 StoreDwords(const Gcn::GcnInst& inst) {
          inst.opcode <= Opcode::BUFFER_STORE_FORMAT_XYZW)) {
         return static_cast<u32>(inst.control.mubuf.count);
     }
-    if (inst.opcode >= Opcode::TBUFFER_STORE_FORMAT_X &&
-        inst.opcode <= Opcode::TBUFFER_STORE_FORMAT_XYZW) {
+    if (IsMtbufStore(inst.opcode)) {
         return static_cast<u32>(inst.control.mtbuf.count);
     }
     return 0;
 }
 
+/// Records the first failure only (the one to report).
+void Fail(std::string& field, const char* format, ...) {
+    if (!field.empty()) {
+        return;
+    }
+    char text[192];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    field = text;
+}
+
 } // namespace
 
 CopyShaderData ParseCopyShader(std::span<const u32> code) {
+    CopyShaderData data{};
+    constexpr u32 token_mov_vcchi = 0xBEEB03FF;
+    if (code.empty() || code[0] != token_mov_vcchi) {
+        Fail(data.failure, "the first instruction is not s_mov_b32 vcc_hi, #imm");
+        return data;
+    }
     Gcn::GcnCodeSlice code_slice{code.data(), code.data() + code.size()};
     Gcn::GcnDecodeContext decoder;
 
-    constexpr u32 token_mov_vcchi = 0xBEEB03FF;
-    ASSERT_MSG(code[0] == token_mov_vcchi, "First instruction is not s_mov_b32 vcc_hi, #imm");
-
-    std::array<s32, 64> offsets{};
+    // The GSVS ring dword each vector register was loaded from (-1: none), never cleared: the
+    // export mapping, as upstream. vgpr_ring below follows overwrites and copies (the stores).
+    std::array<s32, 256> offsets{};
     offsets.fill(-1);
 
-    std::array<s32, 256> sources{};
-    sources.fill(-1);
-
-    // gow3 (stream-out): where scalar registers come from (to find the V# of each store), their
-    // constant values, the ring dword each vector register holds, and constants added to store
-    // addresses (attribute offsets folded into the address register).
+    // Scalar registers: their known constant values, and (gow3, stream-out) where they come
+    // from, to find the V# of each store. Vector registers: the ring dword they hold, and
+    // constants added to store addresses (attribute offsets folded into the address register).
+    SgprConstants sgpr_constants{};
     std::array<ScalarLocation, 128> sgpr_locations{};
     for (u32 i = 0; i < NumUserSgprs; ++i) {
         sgpr_locations[i] = {true, {i, 0, {}}};
     }
-    SgprConstants sgpr_constants{};
     std::array<s32, 256> vgpr_ring{};
     vgpr_ring.fill(-1);
     std::array<u32, 256> vgpr_delta{};
     std::set<u32> ring_loads;
 
-    CopyShaderData data{};
     auto last_attr{IR::Attribute::Position0};
     while (!code_slice.atEnd()) {
-        auto inst = decoder.decodeInstruction(code_slice);
-        switch (inst.opcode) {
-        case Gcn::Opcode::S_LSHL_B32: {
-            ASSERT(inst.src[0].field == Gcn::OperandField::SignedConstIntPos &&
-                   inst.src[1].field == Gcn::OperandField::SignedConstIntPos);
-            sources[inst.dst[0].code] =
-                (inst.src[0].code - Gcn::OperandFieldRange::SignedConstIntPosMin + 1)
-                << (inst.src[1].code - Gcn::OperandFieldRange::SignedConstIntPosMin + 1);
-            break;
-        }
-        case Gcn::Opcode::S_MOVK_I32: {
-            sources[inst.dst[0].code] = inst.control.sopk.simm;
-            break;
-        }
-        case Gcn::Opcode::S_MOV_B32: {
-            sources[inst.dst[0].code] = inst.src[0].code;
-            break;
-        }
-        case Gcn::Opcode::S_ADDK_I32: {
-            sources[inst.dst[0].code] += inst.control.sopk.simm;
-            break;
-        }
-        case Gcn::Opcode::S_BFM_B32: {
-            ASSERT(inst.src[0].field == Gcn::OperandField::SignedConstIntPos &&
-                   inst.src[1].field == Gcn::OperandField::SignedConstIntPos);
-            const auto src0 = inst.src[0].code - Gcn::OperandFieldRange::SignedConstIntPosMin + 1;
-            const auto src1 = inst.src[1].code - Gcn::OperandFieldRange::SignedConstIntPosMin + 1;
-            sources[inst.dst[0].code] = ((1 << src0) - 1) << src1;
-            break;
-        }
+        const auto inst = decoder.decodeInstruction(code_slice);
+        const auto opcode = inst.opcode;
+
+        // What this instruction reads, before its destinations are cleared below.
+        switch (opcode) {
         case Gcn::Opcode::EXP: {
             const auto& exp = inst.control.exp;
             const IR::Attribute semantic = static_cast<IR::Attribute>(exp.target);
-            for (int i = 0; i < inst.src_count; ++i) {
-                if ((exp.en & (1 << i)) == 0) {
+            for (u32 i = 0; i < inst.src_count && i < 4; ++i) {
+                if ((exp.en & (1 << i)) == 0 || inst.src[i].code >= offsets.size()) {
                     continue;
                 }
                 const auto ofs = offsets[inst.src[i].code];
@@ -171,14 +166,19 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
             break;
         }
         case Gcn::Opcode::BUFFER_LOAD_DWORD: {
-            ASSERT_MSG(inst.src[1].code < offsets.size(),
-                       "offsets array for geometry shaders is too short");
-            offsets[inst.src[1].code] = inst.control.mubuf.offset;
-            if (inst.src[3].field != Gcn::OperandField::ConstZero) {
-                const u32 index = inst.src[3].code;
-                ASSERT(sources[index] != -1);
-                offsets[inst.src[1].code] += sources[index];
+            const u32 vdata = inst.src[1].code;
+            const auto soffset = ConstantOf(inst.src[3], sgpr_constants);
+            if (vdata >= offsets.size()) {
+                Fail(data.failure, "a GSVS ring read into v%u", vdata);
+                break;
             }
+            if (!soffset) {
+                Fail(data.failure, "a GSVS ring read (into v%u) at an offset the parser does not "
+                     "know (soffset operand %u)", vdata, inst.src[3].code);
+                offsets[vdata] = -1;
+                break;
+            }
+            offsets[vdata] = static_cast<s32>(inst.control.mubuf.offset + *soffset);
             data.num_comps++;
             break;
         }
@@ -186,8 +186,79 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
             break;
         }
 
-        // gow3 (stream-out): register tracking, after the export mapping above.
-        const auto opcode = inst.opcode;
+        // Scalar constants this instruction produces (any unknown operand: unknown).
+        std::optional<u32> scalar_result;
+        const auto c0 = inst.src_count > 0 ? ConstantOf(inst.src[0], sgpr_constants) : std::nullopt;
+        const auto c1 = inst.src_count > 1 ? ConstantOf(inst.src[1], sgpr_constants) : std::nullopt;
+        const auto sdst_constant = [&]() -> std::optional<u32> {
+            return inst.dst[0].code < sgpr_constants.size() ? sgpr_constants[inst.dst[0].code]
+                                                            : std::nullopt;
+        };
+        const u32 simm = static_cast<u32>(static_cast<s32>(static_cast<s16>(inst.control.sopk.simm)));
+        switch (opcode) {
+        case Gcn::Opcode::S_MOV_B32:
+            scalar_result = c0;
+            break;
+        case Gcn::Opcode::S_MOVK_I32:
+            scalar_result = simm;
+            break;
+        case Gcn::Opcode::S_ADDK_I32:
+            if (const auto value = sdst_constant()) {
+                scalar_result = *value + simm;
+            }
+            break;
+        case Gcn::Opcode::S_MULK_I32:
+            if (const auto value = sdst_constant()) {
+                scalar_result = *value * simm;
+            }
+            break;
+        case Gcn::Opcode::S_LSHL_B32:
+            if (c0 && c1) {
+                scalar_result = *c0 << (*c1 & 31);
+            }
+            break;
+        case Gcn::Opcode::S_LSHR_B32:
+            if (c0 && c1) {
+                scalar_result = *c0 >> (*c1 & 31);
+            }
+            break;
+        case Gcn::Opcode::S_ADD_U32:
+        case Gcn::Opcode::S_ADD_I32:
+            if (c0 && c1) {
+                scalar_result = *c0 + *c1;
+            }
+            break;
+        case Gcn::Opcode::S_SUB_U32:
+        case Gcn::Opcode::S_SUB_I32:
+            if (c0 && c1) {
+                scalar_result = *c0 - *c1;
+            }
+            break;
+        case Gcn::Opcode::S_MUL_I32:
+            if (c0 && c1) {
+                scalar_result = *c0 * *c1;
+            }
+            break;
+        case Gcn::Opcode::S_AND_B32:
+            if (c0 && c1) {
+                scalar_result = *c0 & *c1;
+            }
+            break;
+        case Gcn::Opcode::S_OR_B32:
+            if (c0 && c1) {
+                scalar_result = *c0 | *c1;
+            }
+            break;
+        case Gcn::Opcode::S_BFM_B32:
+            if (c0 && c1) {
+                scalar_result = ((u32{1} << (*c0 & 31)) - 1) << (*c1 & 31);
+            }
+            break;
+        default:
+            break;
+        }
+
+        // Destinations: unknown, unless set below.
         for (u32 i = 0; i < inst.dst_count; ++i) {
             const auto& dst = inst.dst[i];
             if (dst.field == Gcn::OperandField::ScalarGPR) {
@@ -201,13 +272,17 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
                 vgpr_delta[dst.code] = 0;
             }
         }
+        if (scalar_result && inst.dst_count > 0 && inst.dst[0].code < sgpr_constants.size()) {
+            sgpr_constants[inst.dst[0].code] = scalar_result;
+        }
+
         switch (opcode) {
         case Gcn::Opcode::S_MOV_B32:
             if (inst.src[0].field == Gcn::OperandField::ScalarGPR &&
-                inst.src[0].code < sgpr_locations.size()) {
+                inst.src[0].code < sgpr_locations.size() &&
+                inst.dst[0].code < sgpr_locations.size()) {
                 sgpr_locations[inst.dst[0].code] = sgpr_locations[inst.src[0].code];
             }
-            sgpr_constants[inst.dst[0].code] = ConstantOf(inst.src[0], sgpr_constants);
             break;
         case Gcn::Opcode::S_MOV_B64:
             if (inst.src[0].field == Gcn::OperandField::ScalarGPR &&
@@ -216,10 +291,6 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
                 sgpr_locations[inst.dst[0].code] = sgpr_locations[inst.src[0].code];
                 sgpr_locations[inst.dst[0].code + 1] = sgpr_locations[inst.src[0].code + 1];
             }
-            break;
-        case Gcn::Opcode::S_MOVK_I32:
-            sgpr_constants[inst.dst[0].code] =
-                static_cast<u32>(static_cast<s32>(static_cast<s16>(inst.control.sopk.simm)));
             break;
         case Gcn::Opcode::V_MOV_B32:
             if (inst.src[0].field == Gcn::OperandField::VectorGPR &&
@@ -242,12 +313,23 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
             break;
         }
         case Gcn::Opcode::BUFFER_LOAD_DWORD:
-            vgpr_ring[inst.src[1].code] = offsets[inst.src[1].code];
-            ring_loads.insert(static_cast<u32>(offsets[inst.src[1].code]));
+            if (inst.src[1].code < vgpr_ring.size()) {
+                vgpr_ring[inst.src[1].code] = offsets[inst.src[1].code];
+                if (offsets[inst.src[1].code] >= 0) {
+                    ring_loads.insert(static_cast<u32>(offsets[inst.src[1].code]));
+                }
+            }
+            break;
+        case Gcn::Opcode::BUFFER_STORE_BYTE:
+        case Gcn::Opcode::BUFFER_STORE_SHORT:
+            Fail(data.so_failure, "a byte or short store");
             break;
         default:
             if (IsScalarLoad(opcode)) {
                 const u32 sbase = inst.src[0].code * 2;
+                if (sbase + 1 >= sgpr_locations.size()) {
+                    break;
+                }
                 const auto& pointer = sgpr_locations[sbase];
                 const auto& pointer_hi = sgpr_locations[sbase + 1];
                 std::optional<u32> dword_offset;
@@ -271,11 +353,27 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
                     }
                 }
             } else if (const u32 dwords = StoreDwords(inst)) {
-                const bool is_mtbuf = inst.opcode >= Gcn::Opcode::TBUFFER_STORE_FORMAT_X &&
-                                      inst.opcode <= Gcn::Opcode::TBUFFER_STORE_FORMAT_XYZW;
+                const bool is_mtbuf = IsMtbufStore(opcode);
                 const bool offen = is_mtbuf ? inst.control.mtbuf.offen : inst.control.mubuf.offen;
                 const bool idxen = is_mtbuf ? inst.control.mtbuf.idxen : inst.control.mubuf.idxen;
-                u32 offset = is_mtbuf ? inst.control.mtbuf.offset : inst.control.mubuf.offset;
+                const bool addr64 =
+                    is_mtbuf ? inst.control.mtbuf.addr64 : inst.control.mubuf.addr64;
+                if (addr64) {
+                    Fail(data.so_failure, "a store with a 64-bit address");
+                }
+                if (opcode >= Gcn::Opcode::BUFFER_STORE_FORMAT_X &&
+                    opcode <= Gcn::Opcode::BUFFER_STORE_FORMAT_XYZW) {
+                    Fail(data.so_failure, "a store converting to the V#'s format");
+                }
+                if (is_mtbuf) {
+                    // 32, 32_32, 32_32_32, 32_32_32_32: dwords as they are.
+                    const u32 dfmt = static_cast<u32>(inst.control.mtbuf.dfmt);
+                    if (dfmt != 4 && dfmt != 11 && dfmt != 13 && dfmt != 14) {
+                        Fail(data.so_failure, "a typed store of data format %u", dfmt);
+                    }
+                }
+                u32 offset = is_mtbuf ? static_cast<u32>(inst.control.mtbuf.offset)
+                                      : static_cast<u32>(inst.control.mubuf.offset);
                 if (offen) {
                     // With an index as well, the offset is the second address register.
                     const u32 offset_reg = inst.src[0].code + (idxen ? 1 : 0);
@@ -284,15 +382,17 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
                 offset += ConstantOf(inst.src[3], sgpr_constants).value_or(0);
                 // The V#: four consecutive dwords of one origin.
                 const u32 srsrc = inst.src[2].code * 4;
-                ScalarLocation location = sgpr_locations[srsrc];
-                bool traced = location.valid;
+                bool traced = srsrc + 3 < sgpr_locations.size() && sgpr_locations[srsrc].valid;
+                ScalarLocation location = traced ? sgpr_locations[srsrc] : ScalarLocation{};
                 for (u32 i = 1; i < 4 && traced; ++i) {
                     location = location.Next();
                     traced = sgpr_locations[srsrc + i] == location;
                 }
-                StreamOutSharp sharp = sgpr_locations[srsrc].at;
+                StreamOutSharp sharp = traced ? sgpr_locations[srsrc].at : StreamOutSharp{};
                 if (!traced) {
                     sharp = {srsrc, UnresolvedHops, {}};
+                    Fail(data.so_failure, "the V# in s[%u:%u] does not come from user data or "
+                         "memory they point to", srsrc, srsrc + 3);
                 }
                 auto it = std::ranges::find(data.so_sharps, sharp);
                 if (it == data.so_sharps.end()) {
@@ -305,6 +405,9 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
                     if (vdata < vgpr_ring.size() && vgpr_ring[vdata] >= 0) {
                         data.so_stores.push_back(
                             {static_cast<u32>(vgpr_ring[vdata]), sharp_index, offset + i * 4});
+                    } else {
+                        Fail(data.so_failure, "a store of v%u, which does not hold a GSVS ring "
+                             "dword", vdata);
                     }
                 }
             }
@@ -353,7 +456,8 @@ std::array<s32, 4> MapStreamOutBuffers(const CopyShaderData& data, u32 buffer_ma
 }
 
 std::vector<XfbOutput> BuildXfbOutputs(const CopyShaderData& data, u32 buffer_mask,
-                                       const std::array<u32, 4>& strides, u32 first_param) {
+                                       const std::array<u32, 4>& strides, u32 first_param,
+                                       u32* dropped_out) {
     const auto buffers = MapStreamOutBuffers(data, buffer_mask);
     std::array<std::map<u32, u32>, 4> by_offset; // byte offset -> ring dword, per buffer
     u32 dropped = 0;
@@ -384,14 +488,8 @@ std::vector<XfbOutput> BuildXfbOutputs(const CopyShaderData& data, u32 buffer_ma
             run = &outputs.emplace_back(XfbOutput{param, buffer, byte_offset, 1, {ring_offset}});
         }
     }
-    if (dropped) {
-        static bool reported = false;
-        if (!std::exchange(reported, true)) {
-            std::printf("Stream-out: %u copy shader stores left out of the capture (no buffer, "
-                        "past the vertex stride or out of output slots)\n",
-                        dropped);
-            std::fflush(stdout);
-        }
+    if (dropped_out) {
+        *dropped_out = dropped;
     }
     return outputs;
 }

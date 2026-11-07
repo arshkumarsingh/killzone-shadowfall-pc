@@ -91,9 +91,16 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
     case HwStage::Geometry: {
         const auto& gs_info = runtime_info.hw.gs;
         info.gs_copy_data = Shader::ParseCopyShader(gs_info.vs_copy);
-        // gow3 (stream-out): the dwords the copy shader stores to stream-out buffers become
-        // transform feedback outputs after the exported parameters.
-        if (gs_info.xfb_buffer_mask) {
+        // gow3 (stream-out): the pipeline cache admits stream-out pipelines only once their copy
+        // shader parsed (StreamOutPipelineUsable), so this path never asserts. Elsewhere a copy
+        // shader that could not be followed asserts, as it did inside the parser before.
+        const bool streamout = gs_info.xfb_buffer_mask != 0;
+        if (!streamout) {
+            ASSERT_MSG(info.gs_copy_data.failure.empty(), "Copy shader: {}",
+                       info.gs_copy_data.failure);
+        } else if (info.gs_copy_data.failure.empty() && info.gs_copy_data.so_failure.empty()) {
+            // The dwords the copy shader stores to stream-out buffers become transform feedback
+            // outputs after the exported parameters.
             info.gs_copy_data.xfb_outputs =
                 Shader::BuildXfbOutputs(info.gs_copy_data, gs_info.xfb_buffer_mask,
                                         gs_info.xfb_strides, info.gs_copy_data.num_attrs);
@@ -142,6 +149,10 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                 const auto data = ir.BitCast<IR::F32>(IR::U32{inst.Arg(2)});
                 const auto comp_ofs = info.gs_copy_data.output_vertices * sizeof(u32);
                 const auto output_size = gs_info.output_vertices * dwords_per_vertex * sizeof(u32);
+                if (streamout && (comp_ofs == 0 || output_size == 0)) {
+                    inst.Invalidate(); // gow3: no ring layout (never admitted; no division by 0)
+                    break;
+                }
 
                 const auto vc_read_ofs = (((offset / comp_ofs) * comp_ofs) % output_size) * 16u;
                 // gow3 (stream-out): the same ring dword, as the copy shader stores it.
@@ -154,7 +165,7 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                 }
                 const auto& it = info.gs_copy_data.attr_map.find(vc_read_ofs);
                 if (it == info.gs_copy_data.attr_map.cend() &&
-                    !info.gs_copy_data.so_stores.empty()) {
+                    (streamout || !info.gs_copy_data.so_stores.empty())) {
                     // Only streamed out (or not read at all) by a stream-out copy shader.
                     inst.Invalidate();
                     break;

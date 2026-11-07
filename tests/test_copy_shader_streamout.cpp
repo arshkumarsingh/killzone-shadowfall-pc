@@ -62,6 +62,13 @@ static void exp(u32 tgt, u32 en, u32 v0, u32 v1, u32 v2, u32 v3, bool done) {
 static void s_endpgm() {
     code.push_back(0xBF810000);
 }
+/// s_lshl_b32 sdst, ssrc0, ssrc1 (operands as encoded: SGPR number or 128+ inline constant).
+static void s_lshl(u32 sdst, u32 ssrc0, u32 ssrc1) {
+    code.push_back((0b10u << 30) | (30u << 23) | (sdst << 16) | (ssrc1 << 8) | ssrc0);
+}
+static void s_mov(u32 sdst, u32 ssrc0) {
+    code.push_back(0xBE800000u | (sdst << 16) | (3u << 8) | ssrc0);
+}
 
 constexpr u32 LOAD = 12, STORE = 28, STORE_X4 = 30, ZERO = 128;
 
@@ -157,6 +164,57 @@ int main() {
         // Buffer 0 (table dword 0) gets ring 0x1000, buffer 1 (dword 4) ring 0.
         CHECK(output.ring_offsets[0] == (output.buffer == 0 ? 0x1000u : 0u));
     }
+
+    // Killzone's crash (upstream asserted that both s_lshl_b32 operands are inline constants):
+    // the stream-out offset shifted from a register (unknown: the store's base), a ring offset
+    // shifted from constants (folded: 3 << 4 = 48).
+    code.clear();
+    mov_vcchi();
+    ring_loads();
+    s_lshl(21, 128 + 3, 128 + 4);                     // s21 = 48
+    mubuf(LOAD, 5, 0, 4, 21, 0, true, true, true);    // ring 48
+    s_lshl(20, 16, 128 + 2);                          // s20 = s16 << 2 (unknown)
+    mubuf(STORE, 5, 8, 0, 20, 4, true, false, false); // ring 48 -> +4 via s[0:3]
+    exp(12, 0xF, 1, 2, 3, 4, true);
+    s_endpgm();
+    const auto shifted = Shader::ParseCopyShader(code);
+    CHECK(shifted.failure.empty() && shifted.so_failure.empty());
+    CHECK(shifted.so_stores.size() == 1 && shifted.so_stores[0].ring_offset == 48 &&
+          shifted.so_stores[0].byte_offset == 4);
+
+    // A ring read at an offset in an unknown register: a failure, not an assert.
+    code.clear();
+    mov_vcchi();
+    s_lshl(20, 16, 128 + 2);
+    mubuf(LOAD, 1, 0, 4, 20, 0, true, true, true);
+    exp(12, 0xF, 1, 2, 3, 4, true);
+    s_endpgm();
+    CHECK(!Shader::ParseCopyShader(code).failure.empty());
+
+    // Not a PS4 shader header: a failure.
+    code.assign({0xBF810000u});
+    CHECK(!Shader::ParseCopyShader(code).failure.empty());
+
+    // Stores the capture cannot reproduce: a value not read from the ring, a V# in registers
+    // that are not user data (s16-s19), a copied register (v_mov keeps the ring dword).
+    code.clear();
+    mov_vcchi();
+    ring_loads();
+    mubuf(STORE, 20, 8, 0, ZERO, 0, true, false, false);
+    s_endpgm();
+    const auto computed = Shader::ParseCopyShader(code);
+    CHECK(computed.failure.empty() && !computed.so_failure.empty());
+    code.clear();
+    mov_vcchi();
+    ring_loads();
+    s_mov(16, 128 + 1);
+    mubuf(STORE, 6, 8, 16, ZERO, 0, true, false, false);
+    s_endpgm();
+    const auto untraced = Shader::ParseCopyShader(code);
+    CHECK(untraced.failure.empty() && !untraced.so_failure.empty());
+    u32 dropped = 0;
+    Shader::BuildXfbOutputs(data, 0x1, {4, 0, 0, 0}, data.num_attrs, &dropped);
+    CHECK(dropped == 1);
 
     // A copy shader without stores parses as before.
     code.clear();

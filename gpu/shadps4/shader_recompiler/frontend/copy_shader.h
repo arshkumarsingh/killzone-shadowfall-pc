@@ -6,6 +6,7 @@
 #include <array>
 #include <map>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "common/types.h"
@@ -49,6 +50,11 @@ struct CopyShaderData {
     u32 num_attrs{0};
     u32 output_vertices{0};
     u32 num_comps{0};
+    /// gow3: why the copy shader could not be followed; empty when it was. ParseCopyShader never
+    /// asserts: the geometry shader translation asserts on this as before, unless it streams out.
+    std::string failure;
+    /// gow3 (stream-out): a stream-out store the capture cannot reproduce; empty when none.
+    std::string so_failure;
     /// gow3 (stream-out): the copy shader's stores and the V#s they use (in table order).
     std::vector<StreamOutStore> so_stores;
     std::vector<StreamOutSharp> so_sharps;
@@ -56,6 +62,7 @@ struct CopyShaderData {
     std::vector<XfbOutput> xfb_outputs;
 };
 
+/// Never asserts: what it cannot follow is reported in `failure` / `so_failure`.
 CopyShaderData ParseCopyShader(std::span<const u32> code);
 
 /// gow3 (stream-out): the hardware buffer (0-3) each V# of `data` writes, -1 for none. The V#s
@@ -65,8 +72,10 @@ std::array<s32, 4> MapStreamOutBuffers(const CopyShaderData& data, u32 buffer_ma
 
 /// gow3 (stream-out): groups the stores into transform feedback outputs, starting at output
 /// parameter `first_param`. `strides` are the vertex strides in dwords (VGT_STRMOUT_VTX_STRIDE).
-/// Stores past a stride or past the last parameter are left out (and reported once).
+/// Stores without a buffer, past a stride or past the last parameter are left out, counted in
+/// `dropped`.
 std::vector<XfbOutput> BuildXfbOutputs(const CopyShaderData& data, u32 buffer_mask,
-                                       const std::array<u32, 4>& strides, u32 first_param);
+                                       const std::array<u32, 4>& strides, u32 first_param,
+                                       u32* dropped = nullptr);
 
 } // namespace Shader

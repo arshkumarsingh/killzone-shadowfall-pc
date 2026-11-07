@@ -65,6 +65,13 @@ inline bool StreamOutHandled(const AmdGpu::Regs& regs) {
            !config.streamout_3_en && config.rast_stream == 0 && !config.use_rast_stream_mask;
 }
 
+/// Whether a stream-out pipeline with `regs` (StreamOutHandled) can be emulated: its copy shader
+/// parsed, every stream-out store reproducible, something to capture. A new pipeline (by ES, GS
+/// and copy shader, buffers and strides) first prints its three programs, then the verdict (one
+/// line saying why when refused). Any thread. `cached_only` (draw preparation workers): decide
+/// from earlier verdicts only, std::nullopt when there is none.
+std::optional<bool> StreamOutPipelineUsable(const AmdGpu::Regs& regs, bool cached_only);
+
 /// What a stream-out draw binds; copied into the recorded draw command.
 struct XfbDraw {
     bool active = false;
