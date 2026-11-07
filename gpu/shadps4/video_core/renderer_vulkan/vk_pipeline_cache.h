@@ -224,8 +224,12 @@ private:
     /// gow3: GOW3_GPL fast link (vk_pipeline_library.h), GPU thread: the pipeline for `sel`
     /// linked now from ready libraries, else null. No binary check on this thread.
     const GraphicsPipeline* TryFastLink();
-    /// gow3: GOW3_GPL: an urgent job sharing `source`'s snapshot (the optimized compile's).
-    void QueueFastLink(const std::shared_ptr<AsyncGraphicsCompilation>& source);
+    /// gow3: GOW3_GPL: a fast-link job (fast-link threads) on `source`'s snapshot; the optimized
+    /// compile starts on the same snapshot when it is published.
+    void QueueFastLink(std::shared_ptr<AsyncGraphicsCompilation> source);
+    /// gow3: the optimized (monolithic) compile of `build`'s snapshot on the compile threads.
+    bool StartOptimized(std::shared_ptr<AsyncGraphicsCompilation> build,
+                        const GraphicsPipelineKey& key);
     void PublishFastLinks(bool wait = false);
     bool WaitForFastLink();
     void FinishCompilations();

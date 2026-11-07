@@ -13,6 +13,7 @@
 #include <tsl/robin_map.h>
 #include <tsl/robin_set.h>
 
+#include "video_core/renderer_vulkan/vk_async_compiler.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 
@@ -54,9 +55,13 @@ struct AsyncGraphicsCompilation;
 ///
 /// The GPU thread does no binary check and builds nothing unless both stages already have a
 /// library (MayLink, an in-memory index): with a warm binary cache it costs what the build
-/// without fast link costs. The urgent fast-link job decides on a worker: a binary on disk is
-/// restored there (the optimized compile then skips), otherwise it compiles the missing parts
-/// and links while the optimized compile runs.
+/// without fast link costs. A new pipeline goes to the fast-link threads (GOW3_GPL_THREADS,
+/// default 4, normal priority: never behind an 80 ms optimized compile on the compile threads):
+/// a binary on disk is restored there, and that is the optimized pipeline; otherwise the missing
+/// stage parts are compiled, the fragment part on a second fast-link thread when both are
+/// missing (a 22-minute new chapter averaged 51 ms per pre-rasterization and 90 ms per fragment
+/// part), and linked. Only then is the optimized compile queued (PublishFastLinks), so a new area
+/// does not queue every pipeline twice.
 ///
 /// GOW3_GPL=0 leaves the extension out of the device (vk_instance.cpp) and behaves as before.
 /// GOW3_GPL_MAX_LIBRARIES (default 6000) caps the libraries kept (a full play needs ~4,200).
@@ -85,6 +90,8 @@ public:
         return generation.load(std::memory_order_acquire);
     }
     [[nodiscard]] size_t Count() const;
+    /// A part for `key` is ready or being created.
+    [[nodiscard]] bool Contains(Part part, const Key& key) const;
     /// GPU thread gate for a probe: every program module of the pipeline has a ready library
     /// of its part (pre-rasterization or fragment), for some state. Two set lookups.
     [[nodiscard]] bool MayLink(std::span<const vk::ShaderModule> modules) const;
@@ -100,6 +107,8 @@ public:
         std::atomic<u64> link_ns{}, link_worst_ns{};
         std::atomic<u64> restore_ns{};  ///< fast-link jobs' binary restores and misses (worker)
         std::atomic<u32> restore_tries{};
+        std::atomic<u32> parallel{};    ///< fragment parts built by a second fast-link thread
+        std::atomic<u32> unhelped{};    ///< ... or by the job itself, no thread was free
     };
     Counters counters;
 
@@ -168,6 +177,10 @@ public:
     Outcome outcome = Outcome::None;
     bool restore_first = false;              ///< Compile: try the pipeline binary first
     const std::atomic<bool>* cancel = nullptr; ///< Compile: stop before the next shader part
+    /// Compile: when both shader parts are missing, the fragment one is offered to these
+    /// threads (urgent) while this one builds the pre-rasterization part; taken back if no
+    /// thread started it by then.
+    AsyncCompiler* helpers = nullptr;
 
 private:
     bool HashPart(PipelineLibraries::Part part, const GraphicsPipeline& pipeline,
@@ -196,7 +209,11 @@ struct FastLinkState {
     explicit FastLinkState(const Instance& instance) : libraries{instance} {}
 
     PipelineLibraries libraries;
-    /// Fast-link jobs in flight (urgent queue), by pipeline key.
+    /// Fast-link threads (GOW3_GPL_THREADS) and the index of their first VkPipelineCache in
+    /// PipelineCache::worker_pipeline_caches. Null when fast link is off.
+    std::unique_ptr<AsyncCompiler> compiler;
+    size_t cache_base = 0;
+    /// Fast-link jobs in flight, by pipeline key.
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<AsyncGraphicsCompilation>> pending;
     /// Keys never fast-linked: unsupported state or a failed link.
     tsl::robin_set<GraphicsPipelineKey> ineligible;
@@ -207,13 +224,17 @@ struct FastLinkState {
     /// draws, and the parts made with a pipeline's layout outlive it.
     std::vector<std::unique_ptr<GraphicsPipeline>> kept;
 
+    /// Queue to publication of a job: waiting for a thread, running, then waiting for the GPU
+    /// thread's next lookup to publish it (the rest).
     struct Timing {
         u32 count = 0;
-        double total_ms = 0.0, worst_ms = 0.0;
-        void Add(double ms) {
+        double total_ms = 0.0, worst_ms = 0.0, queue_ms = 0.0, work_ms = 0.0;
+        void Add(double total, double queue = 0.0, double work = 0.0) {
             ++count;
-            total_ms += ms;
-            worst_ms = ms > worst_ms ? ms : worst_ms;
+            total_ms += total;
+            queue_ms += queue;
+            work_ms += work;
+            worst_ms = total > worst_ms ? total : worst_ms;
         }
     };
     // Report counters, reset by each report.
@@ -223,10 +244,11 @@ struct FastLinkState {
     /// GPU-thread time in fast-link decisions (gate, probe, job queueing, publication).
     u32 gpu_calls = 0;
     u64 gpu_ns = 0, gpu_worst_ns = 0;
-    Timing ready_shader, ready_fast, ready_optimized;
+    Timing ready_shader, ready_fast, ready_restored, ready_optimized;
     std::array<u32, PipelineLibraries::NumParts> compiled_seen{};
     std::array<u64, PipelineLibraries::NumParts> compile_ns_seen{};
     u32 reused_seen = 0, links_seen = 0, restore_tries_seen = 0;
+    u32 parallel_seen = 0, unhelped_seen = 0;
     u64 link_ns_seen = 0, restore_ns_seen = 0;
 
     void AddGpuTime(u64 ns) {

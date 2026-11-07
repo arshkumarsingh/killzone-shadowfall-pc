@@ -21,6 +21,7 @@
 #include "common/thread.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/scope_exit.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -62,7 +63,8 @@ struct AsyncShaderCompilation {
     vk::ShaderModule module{};
     size_t permutation{};
     bool initial{};
-    std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now(); // gow3: report
+    // gow3: report: queued (before the capture), started and finished on the compile thread.
+    std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now(), started, finished;
     ~AsyncShaderCompilation() {
         ir.reset();
         if (pools) {
@@ -84,15 +86,27 @@ struct AsyncGraphicsCompilation {
     GraphicsPipeline::SerializationSupport data;
     std::unique_ptr<GraphicsPipeline> pipeline;
     bool failure_logged = false;
-    std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now(); // gow3: report
+    // gow3: report: queued, started and finished on the compile thread.
+    std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now(), started, finished;
     // gow3: GOW3_GPL fast-link jobs (PipelineCache::QueueFastLink).
     std::atomic<bool> cancel{false}; ///< the optimized pipeline was published first
     PipelineLinker::Outcome outcome{};
-    /// The optimized compile whose snapshot (selection, infos, fetch) this job reads.
+    /// The snapshot (selection, infos, fetch) this job reads; its optimized compile starts on
+    /// it once the fast link is published (PublishFastLinks).
     std::shared_ptr<AsyncGraphicsCompilation> source;
-    /// Optimized compile: its fast-link job restored the binary, nothing left to do.
-    std::atomic<bool> skip{false};
 };
+
+namespace {
+/// gow3: "ready after" split of a job: total, waiting for a thread, running (ms).
+template <typename Build>
+void AddReady(FastLinkState::Timing& timing, const Build& build) {
+    using Ms = std::chrono::duration<double, std::milli>;
+    const auto now = std::chrono::steady_clock::now();
+    const bool ran = build.started.time_since_epoch().count() != 0;
+    timing.Add(Ms(now - build.queued).count(), ran ? Ms(build.started - build.queued).count() : 0.0,
+               ran ? Ms(build.finished - build.started).count() : 0.0);
+}
+} // namespace
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
@@ -675,6 +689,26 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                  capture_count, count);
     }
     fast_link = std::make_unique<FastLinkState>(instance); // logs the GOW3_GPL mode
+    if (fast_link->libraries.Enabled() && compiler) {
+        // gow3: GOW3_GPL: fast-link jobs get threads of their own, at normal priority: on the
+        // compile threads they waited behind 80 ms optimized compiles. GOW3_GPL_THREADS sets
+        // the count (default: a sixth of the hardware threads, 2..4).
+        const char* env = std::getenv("GOW3_GPL_THREADS");
+        const unsigned threads = env && *env
+                                     ? std::clamp(unsigned(std::atoi(env)), 1u, 16u)
+                                     : std::clamp(Gow3Threads::Available() / 6, 2u, 4u);
+        fast_link->cache_base = worker_pipeline_caches.size();
+        for (unsigned i = 0; i < threads; ++i) {
+            auto [result, worker_cache] = instance.GetDevice().createPipelineCacheUnique({});
+            ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create fast-link pipeline cache");
+            worker_pipeline_caches.push_back(std::move(worker_cache));
+        }
+        fast_link->compiler = std::make_unique<AsyncCompiler>(threads, 64, [](unsigned index) {
+            Common::SetCurrentThreadName(("gow3:FastLink" + std::to_string(index)).c_str());
+            Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
+        });
+        std::printf("GPU: fast-link threads: %u\n", threads);
+    }
     // gow3: the saver thread reads worker_pipeline_caches: start it only once the list is complete.
     if (DriverCacheEnabled()) {
         StartDriverCacheSaver();
@@ -799,6 +833,10 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
         return false;
     }
     const bool queued = build->job.Start(*compiler, [this, build] {
+        build->started = std::chrono::steady_clock::now();
+        SCOPE_EXIT {
+            build->finished = std::chrono::steady_clock::now();
+        };
         PhaseTimer compile{g_gow3_async_ns};
         Shader::Gcn::ScopedFetchShaderSnapshot snapshot{build->fetch};
         auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, build->runtime, *build->ir,
@@ -851,9 +889,7 @@ void PipelineCache::PublishShaders(bool wait) {
             }
             continue;
         }
-        fast_link->ready_shader.Add(std::chrono::duration<double, std::milli>(
-                                        std::chrono::steady_clock::now() - build->queued)
-                                        .count());
+        AddReady(fast_link->ready_shader, *build);
         const auto perm_hash = HashCombine(hash, build->permutation);
         Vulkan::SetObjectName(instance.GetDevice(), build->module,
                              GetShaderName(build->info.hw_stage, hash, build->permutation));
@@ -893,18 +929,12 @@ void PipelineCache::PublishGraphics(bool wait) {
             ++it;
             continue;
         }
-        if (!build->pipeline) {
-            it = pending_graphics.erase(it); // gow3: GOW3_GPL: its fast-link job restored it
-            continue;
-        }
         const auto key = it.key();
         build->pipeline->PublishStages(build->live_infos);
         RegisterPipelineData(key, std::hash<GraphicsPipelineKey>{}(key), build->data);
         // gow3: GOW3_GPL: the optimized pipeline replaces a fast-linked one, which is kept
         // (draws recorded or queued may still use it); a fast link still compiling stops.
-        fast_link->ready_optimized.Add(std::chrono::duration<double, std::milli>(
-                                           std::chrono::steady_clock::now() - build->queued)
-                                           .count());
+        AddReady(fast_link->ready_optimized, *build);
         if (const auto fast = fast_link->pending.find(key); fast != fast_link->pending.end()) {
             fast.value()->cancel = true;
         }
@@ -971,6 +1001,9 @@ void PipelineCache::FinishCompilations() {
     if (compiler) {
         capture_compiler->Stop();
         compiler->Stop();
+        if (fast_link->compiler) {
+            fast_link->compiler->Stop();
+        }
         PublishShaders(true);
         PublishGraphics(true);
         PublishFastLinks(true);
@@ -990,10 +1023,11 @@ void PipelineCache::FinishCompilations() {
 // The GPU thread makes no binary check and builds nothing for a new key unless the library
 // index says both stages already have libraries (MayLink): then it probes (constructs the
 // pipeline with a Probe linker) and links at once when the parts match. Otherwise
-// GetGraphicsPipeline queues the optimized compile as it does without fast link, plus an urgent
-// fast-link job on the same snapshot (QueueFastLink): on a worker, that job restores the
-// pipeline binary when one is on disk (the optimized compile then skips) or compiles the
-// missing parts and links. The optimized pipeline replaces a fast-linked one (PublishGraphics).
+// GetGraphicsPipeline takes the snapshot it takes without fast link and hands it to a
+// fast-link job on the fast-link threads (QueueFastLink): the job restores the pipeline binary
+// when one is on disk (that is the optimized pipeline, nothing follows) or compiles the missing
+// parts and links. PublishFastLinks then starts the optimized compile on the same snapshot; it
+// replaces the fast-linked pipeline in PublishGraphics.
 namespace {
 /// GPU-thread time of one fast-link step, for the report.
 struct FastLinkTimer {
@@ -1056,38 +1090,69 @@ const GraphicsPipeline* PipelineCache::TryFastLink() {
     return nullptr;
 }
 
-void PipelineCache::QueueFastLink(const std::shared_ptr<AsyncGraphicsCompilation>& source) {
-    auto& fast = *fast_link;
-    const auto& key = sel.graphics_key;
-    if (!fast.libraries.Enabled() || fast.ineligible.contains(key) || fast.pending.contains(key)) {
-        return;
+bool PipelineCache::StartOptimized(std::shared_ptr<AsyncGraphicsCompilation> build,
+                                   const GraphicsPipelineKey& key) {
+    if (pending_graphics.contains(key)) {
+        return false;
     }
+    build->queued = std::chrono::steady_clock::now();
+    const bool queued = build->job.Start(*compiler, [this, build] {
+        build->started = std::chrono::steady_clock::now();
+        SCOPE_EXIT {
+            build->finished = std::chrono::steady_clock::now();
+        };
+        // Only the vertex stage uses fetch-shader guest pointers during pipeline construction.
+        Shader::Gcn::ScopedFetchShaderSnapshot snapshot{build->fetch[u32(SwStage::Vertex)]};
+        PhaseTimer compile{g_gow3_async_ns};
+        auto& s = build->selection;
+        build->pipeline = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, s.graphics_key,
+            *worker_pipeline_caches[AsyncCompiler::WorkerIndex()],
+            s.infos, s.runtime_infos, s.fetch_shader, s.modules, build->data, false);
+        return build;
+    });
+    if (queued) {
+        pending_graphics.emplace(key, std::move(build));
+    }
+    return queued;
+}
+
+void PipelineCache::QueueFastLink(std::shared_ptr<AsyncGraphicsCompilation> source) {
+    auto& fast = *fast_link;
+    const GraphicsPipelineKey key = sel.graphics_key;
     FastLinkTimer timer{fast};
-    // No snapshot of its own: the optimized compile's, read by both jobs (nothing writes it).
+    // The job reads the snapshot; the optimized compile runs on it once the fast link is
+    // published (or did not link), so the two never use it at the same time.
     auto build = std::make_shared<AsyncGraphicsCompilation>();
     build->source = source;
     build->live_infos = source->live_infos;
-    const bool queued = build->job.Start(*compiler, [this, build] {
+    const bool queued = build->job.Start(*fast.compiler, [this, build] {
+        build->started = std::chrono::steady_clock::now();
+        SCOPE_EXIT {
+            build->finished = std::chrono::steady_clock::now();
+        };
         auto& source = *build->source;
         Shader::Gcn::ScopedFetchShaderSnapshot snapshot{source.fetch[u32(SwStage::Vertex)]};
         PhaseTimer compile{g_gow3_async_ns};
         auto& s = source.selection;
-        const vk::PipelineCache worker_cache = *worker_pipeline_caches[AsyncCompiler::WorkerIndex()];
-        PipelineLinker linker{fast_link->libraries, PipelineLinker::Mode::Compile, worker_cache,
+        auto& fast = *fast_link;
+        const vk::PipelineCache worker_cache =
+            *worker_pipeline_caches[fast.cache_base + AsyncCompiler::WorkerIndex()];
+        PipelineLinker linker{fast.libraries, PipelineLinker::Mode::Compile, worker_cache,
                               s.graphics_key, s.modules, build->data};
         linker.restore_first = true;
         linker.cancel = &build->cancel;
+        linker.helpers = fast.compiler.get();
         build->pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, s.graphics_key, worker_cache, s.infos,
             s.runtime_infos, s.fetch_shader, s.modules, build->data, false, &linker);
         build->outcome = linker.outcome;
-        if (linker.outcome == PipelineLinker::Outcome::Restored) {
-            source.skip = true; // the optimized pipeline is this one: its compile has nothing to do
-        }
         return build;
-    }, true);
+    });
     if (queued) {
         fast.pending.emplace(key, std::move(build));
+    } else {
+        StartOptimized(std::move(source), key); // the fast-link queue filled up meanwhile
     }
 }
 
@@ -1107,9 +1172,11 @@ void PipelineCache::PublishFastLinks(bool wait) {
             if (build->job.Failed()) {
                 LOG_ERROR(Render_Vulkan, "gow3: fast link {:#x} failed: {}",
                           std::hash<GraphicsPipelineKey>{}(it.key()), build->job.Error());
+                const GraphicsPipelineKey key = it.key();
                 ++fast.failed;
-                fast.ineligible.insert(it.key());
+                fast.ineligible.insert(key);
                 it = fast.pending.erase(it);
+                StartOptimized(build->source, key);
             } else {
                 ++it;
             }
@@ -1123,22 +1190,11 @@ void PipelineCache::PublishFastLinks(bool wait) {
         if (pipeline) {
             pipeline->PublishStages(build->live_infos); // the snapshot dies with the builds
         }
-        const double ready_ms = std::chrono::duration<double, std::milli>(
-                                    std::chrono::steady_clock::now() - build->queued)
-                                    .count();
-        if (!pipeline || !pipeline->Handle()) {
-            if (build->outcome == PipelineLinker::Outcome::Cancelled) {
-                ++fast.optimized_first;
-            } else {
-                ++(build->outcome == PipelineLinker::Outcome::Unsupported ? fast.unsupported
-                                                                           : fast.failed);
-                fast.ineligible.insert(key);
-            }
-        } else if (!pipeline->IsFastLinked()) {
+        if (pipeline && pipeline->Handle() && !pipeline->IsFastLinked()) {
             // Restored from its binary: the optimized pipeline, published as PublishGraphics
-            // would (its own compile skips).
+            // would; no optimized compile follows.
             ++fast.restored;
-            fast.ready_optimized.Add(ready_ms);
+            AddReady(fast.ready_restored, *build);
             RegisterPipelineData(key, std::hash<GraphicsPipelineKey>{}(key), build->data);
             ++num_new_pipelines;
             auto [slot, inserted] = graphics_pipelines.try_emplace(key);
@@ -1150,17 +1206,29 @@ void PipelineCache::PublishFastLinks(bool wait) {
                 slot.value() = std::move(pipeline);
             }
             continue;
-        } else if (graphics_pipelines.contains(key)) {
-            ++fast.optimized_first; // the optimized (or the warm-up's) came first
-        } else {
-            fast.ready_fast.Add(ready_ms);
+        }
+        if (pipeline && pipeline->Handle() && !graphics_pipelines.contains(key)) {
+            AddReady(fast.ready_fast, *build);
             ++fast.linked_async;
             graphics_pipelines.emplace(key, std::move(pipeline));
-            continue;
+        } else if (pipeline && pipeline->Handle()) {
+            ++fast.optimized_first; // the warm-up's (or an optimized compile's) came first
+        } else if (build->outcome == PipelineLinker::Outcome::Cancelled) {
+            ++fast.optimized_first;
+        } else {
+            ++(build->outcome == PipelineLinker::Outcome::Unsupported ? fast.unsupported
+                                                                       : fast.failed);
+            fast.ineligible.insert(key);
         }
         if (pipeline) {
             fast.kept.push_back(std::move(pipeline)); // its layout made libraries: keep it
         }
+        // Now the optimized compile, on the same snapshot (when the queue is full, the next
+        // lookup of a fast-linked pipeline queues it, GetGraphicsPipeline).
+        if (graphics_pipelines.contains(key) && !graphics_pipelines.at(key)->IsFastLinked()) {
+            continue; // an optimized one is in already
+        }
+        StartOptimized(build->source, key);
     }
     if (published) {
         fast.AddGpuTime(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1289,7 +1357,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             return found->second.get();
         }
         const GraphicsPipeline* linked = optimize ? found->second.get() : TryFastLink();
-        if (!pending_graphics.contains(sel.graphics_key) && compiler->HasCapacity()) {
+        // gow3: GOW3_GPL: a new pipeline goes to the fast-link threads; its optimized compile
+        // starts once the fast link is published (PublishFastLinks).
+        const bool fast = !linked && fast_link->compiler &&
+                          !fast_link->ineligible.contains(sel.graphics_key);
+        AsyncCompiler& queue = fast ? *fast_link->compiler : *compiler;
+        if (!pending_graphics.contains(sel.graphics_key) &&
+            !fast_link->pending.contains(sel.graphics_key) && queue.HasCapacity()) {
             PhaseTimer capture{g_gow3_snapshot_ns};
             auto build = std::make_shared<AsyncGraphicsCompilation>();
             build->selection = sel;
@@ -1304,25 +1378,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                     build->fetch[i].Capture(*build->infos[i]);
                 }
             }
-            const bool queued = build->job.Start(*compiler, [this, build] {
-                if (build->skip) {
-                    return build; // gow3: GOW3_GPL: its fast-link job restored the binary
-                }
-                // Only the vertex stage uses fetch-shader guest pointers during pipeline construction.
-                Shader::Gcn::ScopedFetchShaderSnapshot snapshot{build->fetch[u32(SwStage::Vertex)]};
-                PhaseTimer compile{g_gow3_async_ns};
-                auto& s = build->selection;
-                build->pipeline = std::make_unique<GraphicsPipeline>(
-                    instance, scheduler, desc_heap, profile, s.graphics_key,
-                    *worker_pipeline_caches[AsyncCompiler::WorkerIndex()],
-                    s.infos, s.runtime_infos, s.fetch_shader, s.modules, build->data, false);
-                return build;
-            });
-            if (queued && !linked) {
-                QueueFastLink(build); // gow3: GOW3_GPL: urgent, on this snapshot
-            }
-            if (queued) {
-                pending_graphics.emplace(sel.graphics_key, std::move(build));
+            if (fast) {
+                QueueFastLink(std::move(build));
+            } else {
+                StartOptimized(std::move(build), sel.graphics_key);
             }
         }
         if (linked) {

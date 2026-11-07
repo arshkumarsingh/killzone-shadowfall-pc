@@ -12,6 +12,7 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_library.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -381,6 +382,11 @@ size_t PipelineLibraries::Count() const {
     return total;
 }
 
+bool PipelineLibraries::Contains(Part part, const Key& key) const {
+    std::scoped_lock lock{mutex};
+    return entries[part].contains(key);
+}
+
 bool PipelineLibraries::MayLink(std::span<const vk::ShaderModule> modules) const {
     if (!enabled) {
         return false;
@@ -720,21 +726,88 @@ vk::ResultValue<vk::UniquePipeline> PipelineLinker::Create(const GraphicsPipelin
                     .push_back(handle);
             }
         }
-        for (const auto part :
-             {Libs::VertexInput, Libs::FragmentOutput, Libs::PreRaster, Libs::FragmentShader}) {
-            if (cancel && cancel->load(std::memory_order_relaxed)) {
-                return not_linked(Outcome::Cancelled);
-            }
-            std::span<const u64> indexed;
-            if (part == Libs::PreRaster) {
-                indexed = {pre_raster_modules.data(), pre_raster_modules.size()};
-            } else if (part == Libs::FragmentShader) {
-                indexed = {fragment_modules.data(), fragment_modules.size()};
-            }
-            parts[part] = libraries.Acquire(part, keys[part], info, cache, true, true, indexed);
+        const auto cancelled = [&] { return cancel && cancel->load(std::memory_order_relaxed); };
+        for (const auto part : {Libs::VertexInput, Libs::FragmentOutput}) {
+            parts[part] = libraries.Acquire(part, keys[part], info, cache, true, true);
             if (!parts[part]) {
                 return not_linked(Outcome::Failed);
             }
+        }
+        if (cancelled()) {
+            return not_linked(Outcome::Cancelled);
+        }
+        // Both shader parts missing: the fragment one (the slower one) is offered to another
+        // fast-link thread while this one builds the pre-rasterization part. The offer reads
+        // this create info only once claimed, and a claimed offer is always awaited before this
+        // returns (settle, also on every early return); an unclaimed one is withdrawn and this
+        // thread builds the part itself.
+        struct Offer {
+            std::mutex mutex;
+            std::condition_variable cv;
+            bool claimed = false, done = false, withdrawn = false;
+        };
+        std::shared_ptr<Offer> offer;
+        const auto settle = [&] {
+            if (!offer) {
+                return;
+            }
+            std::unique_lock lock{offer->mutex};
+            if (!offer->claimed) {
+                if (!offer->withdrawn) {
+                    offer->withdrawn = true;
+                    libraries.counters.unhelped.fetch_add(1, std::memory_order_relaxed);
+                }
+                return;
+            }
+            offer->cv.wait(lock, [&] { return offer->done; });
+        };
+        SCOPE_EXIT {
+            settle();
+        };
+        if (helpers && !libraries.Contains(Libs::PreRaster, keys[Libs::PreRaster]) &&
+            !libraries.Contains(Libs::FragmentShader, keys[Libs::FragmentShader])) {
+            offer = std::make_shared<Offer>();
+            const bool offered = helpers->Submit(
+                [offer, libs = &libraries, key = keys[Libs::FragmentShader], target = &info,
+                 cache = cache, indexed = fragment_modules] {
+                    {
+                        std::scoped_lock lock{offer->mutex};
+                        if (offer->withdrawn) {
+                            return; // its job built it: `target` may be gone, never read it
+                        }
+                        offer->claimed = true;
+                    }
+                    SCOPE_EXIT {
+                        {
+                            std::scoped_lock lock{offer->mutex};
+                            offer->done = true;
+                        }
+                        offer->cv.notify_all();
+                    };
+                    libs->Acquire(Libs::FragmentShader, key, *target, cache, true, true,
+                                  {indexed.data(), indexed.size()});
+                    libs->counters.parallel.fetch_add(1, std::memory_order_relaxed);
+                },
+                true);
+            if (!offered) {
+                offer.reset();
+            }
+        }
+        parts[Libs::PreRaster] =
+            libraries.Acquire(Libs::PreRaster, keys[Libs::PreRaster], info, cache, true, true,
+                              {pre_raster_modules.data(), pre_raster_modules.size()});
+        if (!parts[Libs::PreRaster]) {
+            return not_linked(Outcome::Failed);
+        }
+        settle();
+        if (cancelled()) {
+            return not_linked(Outcome::Cancelled);
+        }
+        parts[Libs::FragmentShader] =
+            libraries.Acquire(Libs::FragmentShader, keys[Libs::FragmentShader], info, cache, true,
+                              true, {fragment_modules.data(), fragment_modules.size()});
+        if (!parts[Libs::FragmentShader]) {
+            return not_linked(Outcome::Failed);
         }
     }
 
@@ -792,6 +865,12 @@ void FastLinkState::Report() {
     const u64 link_ns = link_ns_total - link_ns_seen;
     links_seen = links_total;
     link_ns_seen = link_ns_total;
+    const u32 parallel_total = c.parallel.load(std::memory_order_relaxed);
+    const u32 unhelped_total = c.unhelped.load(std::memory_order_relaxed);
+    const u32 parallel = parallel_total - parallel_seen;
+    const u32 unhelped = unhelped_total - unhelped_seen;
+    parallel_seen = parallel_total;
+    unhelped_seen = unhelped_total;
     const u32 tries_total = c.restore_tries.load(std::memory_order_relaxed);
     const u64 restore_ns_total = c.restore_ns.load(std::memory_order_relaxed);
     const u32 restore_tries = tries_total - restore_tries_seen;
@@ -802,7 +881,7 @@ void FastLinkState::Report() {
     const bool fast_activity = linked_now || linked_async || replaced || optimized_first ||
                                restored || unsupported || failed || compiled_any || gpu_calls ||
                                restore_tries;
-    const bool timing_activity = ready_shader.count || ready_fast.count ||
+    const bool timing_activity = ready_shader.count || ready_fast.count || ready_restored.count ||
                                  ready_optimized.count || pending_shader || pending_pipeline;
     if (!fast_activity && !timing_activity) {
         return;
@@ -817,7 +896,8 @@ void FastLinkState::Report() {
             "the optimized pipeline, %u optimized first; %u restored from binaries on workers "
             "(%u tries, avg %.2f ms), %u not linkable, %u failed; GPU thread %.2f ms in %u "
             "fast-link steps (worst %.2f ms, %u probes); libraries compiled: %u "
-            "pre-raster (avg %.1f ms), %u fragment (avg %.1f ms), %u vertex input, %u output, %u "
+            "pre-raster (avg %.1f ms), %u fragment (avg %.1f ms; %u on a second thread, %u "
+            "without one free), %u vertex input, %u output, %u "
             "reused; %u links (avg %.2f ms, worst %.2f ms); %zu libraries, %zu pipelines kept\n",
             linked_now, linked_async, replaced, optimized_first, restored, restore_tries,
             avg(restore_ns, restore_tries), unsupported, failed, double(gpu_ns) / 1e6, gpu_calls,
@@ -827,21 +907,26 @@ void FastLinkState::Report() {
             compiled[PipelineLibraries::FragmentShader],
             avg(compile_ns[PipelineLibraries::FragmentShader],
                 compiled[PipelineLibraries::FragmentShader]),
+            parallel, unhelped,
             compiled[PipelineLibraries::VertexInput], compiled[PipelineLibraries::FragmentOutput],
             reused, links, avg(link_ns, links), c.link_worst_ns.load() / 1e6, libraries.Count(),
             kept.size());
     }
     if (timing_activity) {
-        const auto line = [](const Timing& t) {
-            return t.count ? t.total_ms / t.count : 0.0;
-        };
-        std::printf("Shaders: ready after (avg/worst ms, count): shaders %.0f/%.0f (%u), "
-                    "fast-linked pipelines %.0f/%.0f (%u), optimized pipelines %.0f/%.0f (%u); "
+        // avg/worst, count, then the average split: waiting for a thread + running (the rest of
+        // the average is waiting for the GPU thread to publish it).
+        char text[4][96];
+        const Timing* timings[4] = {&ready_shader, &ready_fast, &ready_restored, &ready_optimized};
+        for (int i = 0; i < 4; ++i) {
+            const Timing& t = *timings[i];
+            const double n = t.count ? double(t.count) : 1.0;
+            std::snprintf(text[i], sizeof(text[i]), "%.0f/%.0f (%u; %.0f queue + %.0f work)",
+                          t.total_ms / n, t.worst_ms, t.count, t.queue_ms / n, t.work_ms / n);
+        }
+        std::printf("Shaders: ready after (avg/worst ms, count; avg queue + work ms): shaders %s, "
+                    "fast-linked pipelines %s, restored pipelines %s, optimized pipelines %s; "
                     "lookups waiting on a shader %u, on a pipeline %u\n",
-                    line(ready_shader), ready_shader.worst_ms, ready_shader.count, line(ready_fast),
-                    ready_fast.worst_ms, ready_fast.count, line(ready_optimized),
-                    ready_optimized.worst_ms, ready_optimized.count, pending_shader,
-                    pending_pipeline);
+                    text[0], text[1], text[2], text[3], pending_shader, pending_pipeline);
     }
     std::fflush(stdout);
     linked_now = linked_async = replaced = optimized_first = 0;
@@ -849,7 +934,7 @@ void FastLinkState::Report() {
     gpu_calls = 0;
     gpu_ns = gpu_worst_ns = 0;
     pending_shader = pending_pipeline = 0;
-    ready_shader = ready_fast = ready_optimized = {};
+    ready_shader = ready_fast = ready_restored = ready_optimized = {};
 }
 
 } // namespace Vulkan
