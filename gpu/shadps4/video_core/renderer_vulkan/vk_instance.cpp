@@ -388,8 +388,10 @@ bool Instance::CreateDevice() {
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     // gow3 (stream-out): GCN stream-out through transform feedback (vk_stream_out.h).
     if (StreamOutWanted() && features.geometryShader &&
-        std::ranges::find(available_extensions, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME) !=
-            available_extensions.end()) {
+        std::any_of(available_extensions.begin(), available_extensions.end(),
+                    [](const std::string& name) {
+                        return name == VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME;
+                    })) {
         const auto chain = physical_device.getFeatures2<
             vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceTransformFeedbackFeaturesEXT>();
         transform_feedback =

@@ -252,7 +252,7 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
                 const auto& pointer_hi = sgpr_locations[sbase + 1];
                 std::optional<u32> dword_offset;
                 if (inst.control.smrd.imm) {
-                    dword_offset = inst.control.smrd.offset;
+                    dword_offset = static_cast<u32>(inst.control.smrd.offset);
                 } else if (inst.control.smrd.offset == 0xFF) {
                     dword_offset = inst.src[1].code;
                 } else if (inst.control.smrd.offset < sgpr_constants.size() &&
