@@ -1,0 +1,70 @@
+# Killzone test build of this fork: the game executable and the MSYS2 DLLs it needs, as an
+# artifact (bin-fork/) to drop beside an installed copy's bin/ and start with GOW3_PROBE. It does not
+# make the launcher or the zip (packaging/windows/package_kzsf.sh does, with the game's icon).
+# Runs on pushes to the pdf-informed-fixes branch, or by hand (Actions > Killzone fork build).
+name: Killzone fork build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [pdf-informed-fixes]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kzsf-fork-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      # The runner's Git turns LF into CRLF, and the FSR-Vulkan patches then no longer apply.
+      - name: Keep LF line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          release: false
+          update: true
+          install: git patch
+          pacboy: >-
+            toolchain:p cmake:p ninja:p pkgconf:p python:p
+            vulkan-headers:p vulkan-loader:p vulkan-memory-allocator:p glslang:p
+            sdl3:p fmt:p boost:p robin-map:p xxhash:p ffmpeg:p zydis:p
+            spirv-tools:p spirv-headers:p spirv-cross:p
+      # Kernel semaphores on this winpthreads, 20 runs with a timeout each (a hang fails the job).
+      - name: Semaphore stress
+        run: |
+          mkdir -p out
+          clang -std=c11 -O2 -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_sema_stress.c src/runtime_sema.c -o out/sema-stress.exe
+          for i in $(seq 1 20); do timeout 60 out/sema-stress.exe || { echo "run $i failed or hung"; exit 1; }; done
+      # The executable's icon comes from the player's dump (make_kzsf_icon.py) and is not in git;
+      # this test build embeds the repository's launcher icon instead (the window shows the game's).
+      - name: Stand-in executable icon
+        run: '[ -f launcher/kzsf.ico ] || cp launcher/gow3.ico launcher/kzsf.ico'
+      - name: Build
+        run: bash build.sh
+      - name: Collect the executable and its DLLs
+        run: |
+          mkdir -p dist/bin-fork
+          llvm-strip --strip-debug -o dist/bin-fork/KillzoneShadowFall.exe out/gow3-probe.exe
+          ldd dist/bin-fork/KillzoneShadowFall.exe | awk '/\/clang64\/bin\// {print $3}' | sort -u | while read -r dll; do
+            cp -u "$dll" dist/bin-fork/
+          done
+          git rev-parse HEAD > dist/bin-fork/COMMIT.txt
+          ls dist/bin-fork | wc -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kzsf-fork-bin
+          path: dist/bin-fork
+          if-no-files-found: error
